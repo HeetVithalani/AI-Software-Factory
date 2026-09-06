@@ -1,0 +1,10 @@
+ollama:
+  base_url: "http://localhost:11434"
+  request_timeout_seconds: 120
+  model_pull_enabled: false   # never auto-pull models
+
+opencode:
+  enabled: false
+  base_url: ""
+  api_key_env_var: "OPENCODE_API_KEY"
+  allow_sensitive_data: false  # must be explicitly unlocked per project

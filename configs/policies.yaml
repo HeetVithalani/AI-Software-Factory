@@ -1,0 +1,6 @@
+policies:
+  require_approval_git_mutations: true
+  require_approval_sensitive_data: true
+  require_approval_high_risk: true
+  block_sensitive_to_remote: true
+  production_deployment_forbidden: true

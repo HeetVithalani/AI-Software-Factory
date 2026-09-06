@@ -1,0 +1,17 @@
+# Balanced (production) profile — default
+profile: balanced
+
+quality:
+  min_test_coverage: 80
+  require_security_scan: true
+  require_documentation: true
+  require_code_review: true
+  review_depth: "standard"
+
+scheduler:
+  max_concurrent_tasks: 2
+  task_timeout_seconds: 600
+
+models:
+  prefer_smaller: false
+  max_vram_gb: 5.5

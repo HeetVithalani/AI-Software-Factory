@@ -1,0 +1,18 @@
+# Fast profile — optimised for speed, lower quality thresholds
+profile: fast
+
+quality:
+  # Minimum test coverage % (0 = not enforced in fast mode)
+  min_test_coverage: 0
+  require_security_scan: false
+  require_documentation: false
+  require_code_review: true
+  review_depth: "light"
+
+scheduler:
+  max_concurrent_tasks: 2
+  task_timeout_seconds: 300
+
+models:
+  prefer_smaller: true
+  max_vram_gb: 4.0

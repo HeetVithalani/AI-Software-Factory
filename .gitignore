@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Runtime / local state
+factory.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated/runtime directories
+artifacts/
+backups/
+cache/
+logs/
+temp/
+models/
+
+# Factory backups
+factory-backup-before-git-policy/
+
+# Project workspaces
+projects/
+
+# Local secrets / environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+credentials
+credentials.json
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Backup files
+*.backup
+*.bak
+

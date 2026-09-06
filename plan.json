@@ -1,0 +1,82 @@
+{
+  "project_id": "proj-test",
+  "description": "proj",
+  "tasks": [
+    {
+      "task_id": "task-requirements_analysis",
+      "name": "Requirements Analysis",
+      "agent_type": "planner",
+      "description": "Analyse and structure the project requirements",
+      "depends_on": [],
+      "metadata": {}
+    },
+    {
+      "task_id": "task-security_baseline",
+      "name": "Security Baseline",
+      "agent_type": "security",
+      "description": "Scan workspace for pre-existing sensitive data",
+      "depends_on": [],
+      "metadata": {}
+    },
+    {
+      "task_id": "task-build",
+      "name": "Build",
+      "agent_type": "builder",
+      "description": "Implement the required functionality",
+      "depends_on": [],
+      "metadata": {}
+    },
+    {
+      "task_id": "task-review",
+      "name": "Review",
+      "agent_type": "reviewer",
+      "description": "Review the built artefacts for correctness",
+      "depends_on": [
+        "task-build"
+      ],
+      "metadata": {}
+    },
+    {
+      "task_id": "task-test",
+      "name": "Test",
+      "agent_type": "qa",
+      "description": "Run the automated test suite",
+      "depends_on": [
+        "task-build"
+      ],
+      "metadata": {}
+    },
+    {
+      "task_id": "task-security_scan",
+      "name": "Security Scan",
+      "agent_type": "security",
+      "description": "Scan for sensitive data leaks and vulnerabilities",
+      "depends_on": [
+        "task-build"
+      ],
+      "metadata": {}
+    },
+    {
+      "task_id": "task-documentation",
+      "name": "Documentation",
+      "agent_type": "documentation",
+      "description": "Generate project documentation",
+      "depends_on": [
+        "task-review",
+        "task-test"
+      ],
+      "metadata": {}
+    },
+    {
+      "task_id": "task-audit",
+      "name": "Audit",
+      "agent_type": "auditor",
+      "description": "Produce final audit report",
+      "depends_on": [
+        "task-security_scan",
+        "task-documentation"
+      ],
+      "metadata": {}
+    }
+  ]
+}
