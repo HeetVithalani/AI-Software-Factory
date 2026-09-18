@@ -97,11 +97,11 @@ class AuditorAgent(BaseAgent):
         if not response.success:
             return self._fail(task, f"LLM failed: {response.error}")
             
-        if not response.structured_output:
+        if not response.structured_data:
             return self._fail(task, "LLM returned no structured output")
             
         try:
-            proposal = AuditorProposal.model_validate_json(response.structured_output)
+            proposal = AuditorProposal.model_validate(response.structured_data)
         except Exception as exc:
             return self._fail(task, f"Failed to parse LLM output as AuditorProposal: {exc}")
 

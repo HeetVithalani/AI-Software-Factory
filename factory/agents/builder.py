@@ -15,6 +15,11 @@ from factory.models import AgentResult, TaskRecord
 from factory.agents.base import BaseAgent
 from factory.llm.schemas.builder import BuilderProposal
 from factory.llm.retry import RetryPolicy, RecoveryAction
+from factory.llm.structured_output import (
+    parse_structured_response,
+    parse_structured_data,
+    StructuredOutputError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,39 +85,68 @@ class BuilderAgent(BaseAgent):
             attempt = 0
             response = None
             proposal = None
-            
+
             while attempt <= retry_policy.max_retries:
                 response = self._llm.complete(request, retry_count=attempt)
-                if response.success and response.structured_data:
+                if response.success:
                     try:
-                        proposal = BuilderProposal(**response.structured_data)
+                        context_hint = f"BuilderAgent turn {turns} attempt {attempt}"
+                        if response.structured_data:
+                            proposal = parse_structured_data(
+                                response.structured_data,
+                                BuilderProposal,
+                                context=context_hint,
+                            )
+                        elif response.content:
+                            proposal = parse_structured_response(
+                                response.content,
+                                BuilderProposal,
+                                context=context_hint,
+                            )
+                        else:
+                            raise StructuredOutputError(
+                                "LLM returned empty content and no structured data",
+                            )
                         break
-                    except Exception as e:
-                        error_msg = f"Failed to parse BuilderProposal: {e}"
-                        logger.warning(error_msg)
+                    except StructuredOutputError as e:
+                        error_msg = str(e)
+                        logger.warning("Builder parse error: %s", error_msg)
+                        self._emit("agent.builder.parse_error", {
+                            "task_id": task.task_id,
+                            "attempt": attempt,
+                            "error": error_msg,
+                        })
                         action = retry_policy.determine_action(attempt, error_msg)
                 else:
-                    error_msg = response.error or "No structured data returned"
+                    error_msg = response.error or "LLM request failed"
                     logger.warning("LLM request failed: %s", error_msg)
                     action = retry_policy.determine_action(attempt, error_msg)
-                    
+
                 if action == RecoveryAction.ESCALATE:
                     break
                 elif action == RecoveryAction.RETRY_AUGMENTED:
-                    messages.append({"role": "user", "content": f"Previous output was invalid: {error_msg}. Please fix and try again."})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Previous output was invalid: {error_msg}. "
+                            "Respond with ONLY a valid JSON object matching "
+                            "the required schema. No prose, no markdown fences."
+                        ),
+                    })
                     request = self._context.build_request(
                         task_id=task.task_id,
                         system_prompt=system_prompt,
                         messages=messages,
                         output_schema=BuilderProposal.model_json_schema(),
                     )
-                    
+
                 attempt += 1
                 retry_policy.wait(attempt)
-                
+
             if not proposal:
                 return self._fail(task, "Failed to get valid BuilderProposal from LLM after retries")
-                
+
+
             # Append model's response to transcript
             messages.append({"role": "assistant", "content": response.content})
             

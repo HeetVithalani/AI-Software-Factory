@@ -108,11 +108,11 @@ class ReviewerAgent(BaseAgent):
         if not response.success:
             return self._fail(task, f"LLM failed: {response.error}")
             
-        if not response.structured_output:
+        if not response.structured_data:
             return self._fail(task, "LLM returned no structured output")
             
         try:
-            proposal = ReviewerProposal.model_validate_json(response.structured_output)
+            proposal = ReviewerProposal.model_validate(response.structured_data)
         except Exception as exc:
             return self._fail(task, f"Failed to parse LLM output as ReviewerProposal: {exc}")
 

@@ -38,8 +38,8 @@ class SecurityAgent(BaseAgent):
         scan_target = task.metadata.get("scan_target", ".")
 
         # Deterministic scan
-        result = security_tool.run_scan(
-            scan_target=scan_target,
+        result = security_tool.scan_directory(
+            path=Path(scan_target),
             task_id=task.task_id,
         )
 
@@ -71,7 +71,7 @@ class SecurityAgent(BaseAgent):
             return self._fail(task, f"LLM failed: {llm_res.error}")
             
         try:
-            proposal = SecurityProposal.model_validate_json(llm_res.structured_output)
+            proposal = SecurityProposal.model_validate(llm_res.structured_data)
         except Exception as exc:
             return self._fail(task, f"Failed to parse LLM output: {exc}")
 

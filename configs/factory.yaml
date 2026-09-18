@@ -12,3 +12,12 @@ resources:
   total_vram_gb: 6.0
   max_inference_ram_gb: 10.0
   max_inference_vram_gb: 5.5
+
+# OpenCode server runtime — lifecycle only, NOT model credentials
+# model selection stays in models.yaml
+opencode_runtime:
+  host: "127.0.0.1"
+  port: 7878
+  startup_timeout_seconds: 10
+  request_timeout_seconds: 120
+  manage_server: true   # factory manages one opencode serve process

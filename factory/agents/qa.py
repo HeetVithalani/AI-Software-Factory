@@ -70,7 +70,7 @@ class QAAgent(BaseAgent):
             return self._fail(task, f"LLM failed: {llm_res.error}")
             
         try:
-            proposal = QAProposal.model_validate_json(llm_res.structured_output)
+            proposal = QAProposal.model_validate(llm_res.structured_data)
         except Exception as exc:
             return self._fail(task, f"Failed to parse LLM output: {exc}")
 

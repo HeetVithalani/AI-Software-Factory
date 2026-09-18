@@ -1,0 +1,16 @@
+{
+  "project_id": "hello-project",
+  "description": "Test Project",
+  "decisions": [],
+  "assumptions": [],
+  "tasks": [
+    {"task_id": "task-plan", "name": "Plan", "agent_type": "planner", "depends_on": [], "description": "T1", "metadata": {}},
+    {"task_id": "task-build", "name": "Build", "agent_type": "builder", "depends_on": ["task-plan"], "description": "T2", "metadata": {}},
+    {"task_id": "task-review", "name": "Review", "agent_type": "reviewer", "depends_on": ["task-build"], "description": "T3", "metadata": {}},
+    {"task_id": "task-qa", "name": "QA", "agent_type": "qa", "depends_on": ["task-build"], "description": "T4", "metadata": {}},
+    {"task_id": "task-security-baseline", "name": "Security Baseline", "agent_type": "security", "depends_on": ["task-build"], "description": "T5", "metadata": {}},
+    {"task_id": "task-security-scan", "name": "Security Scan", "agent_type": "security", "depends_on": ["task-security-baseline"], "description": "T6", "metadata": {}},
+    {"task_id": "task-docs", "name": "Docs", "agent_type": "documentation", "depends_on": ["task-security-scan"], "description": "T7", "metadata": {}},
+    {"task_id": "task-audit", "name": "Audit", "agent_type": "auditor", "depends_on": ["task-docs"], "description": "T8", "metadata": {}}
+  ]
+}

@@ -78,10 +78,27 @@ class OpenCodeSettings:
 
 
 @dataclass
+class OpenCodeRuntimeSettings:
+    """
+    OpenCode server lifecycle configuration.
+    Kept in factory.yaml (runtime) — separate from models.yaml (capabilities).
+    """
+    host: str = "127.0.0.1"
+    port: int = 7878
+    startup_timeout_seconds: int = 10
+    request_timeout_seconds: int = 120
+    # If True, factory will start and manage its own opencode serve process
+    manage_server: bool = True
+
+
+@dataclass
 class ModelsSettings:
     """Model registry configuration."""
     ollama: OllamaSettings = field(default_factory=OllamaSettings)
     opencode: OpenCodeSettings = field(default_factory=OpenCodeSettings)
+    # Default model used when no agent-specific override is given.
+    # Format: "<provider>:<model>"  e.g. "ollama:qwen2.5-coder:7b"
+    default_model: str = "ollama:qwen2.5-coder:7b"
     # Fallback when preferred model unavailable
     fallback_to_stub: bool = True
 
@@ -122,6 +139,9 @@ class FullSettings:
     models: ModelsSettings = field(default_factory=ModelsSettings)
     resources: ResourceSettings = field(default_factory=ResourceSettings)
     policies: PolicySettings = field(default_factory=PolicySettings)
+    opencode_runtime: OpenCodeRuntimeSettings = field(
+        default_factory=OpenCodeRuntimeSettings
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +202,20 @@ def _apply_factory_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
     if "max_inference_vram_gb" in r:
         rs.max_inference_vram_gb = float(r["max_inference_vram_gb"])
 
+    # OpenCode runtime (server lifecycle) — separate from models.yaml
+    ocr = data.get("opencode_runtime", {})
+    ort = settings.opencode_runtime
+    if "host" in ocr:
+        ort.host = str(ocr["host"])
+    if "port" in ocr:
+        ort.port = int(ocr["port"])
+    if "startup_timeout_seconds" in ocr:
+        ort.startup_timeout_seconds = int(ocr["startup_timeout_seconds"])
+    if "request_timeout_seconds" in ocr:
+        ort.request_timeout_seconds = int(ocr["request_timeout_seconds"])
+    if "manage_server" in ocr:
+        ort.manage_server = bool(ocr["manage_server"])
+
 
 def _apply_models_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
     """Apply models.yaml values onto the FullSettings instance."""
@@ -204,6 +238,10 @@ def _apply_models_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
         ocs.api_key_env_var = str(oc["api_key_env_var"])
     if "allow_sensitive_data" in oc:
         ocs.allow_sensitive_data = bool(oc["allow_sensitive_data"])
+
+    # Default model — stays in models.yaml (capability config, not runtime)
+    if "default_model" in data:
+        settings.models.default_model = str(data["default_model"])
 
 
 def _apply_policies_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
@@ -244,9 +282,9 @@ def get_settings() -> FullSettings:
     Load and return the singleton FullSettings for this factory instance.
 
     Loads (in order):
-      configs/factory.yaml
-      configs/models.yaml
-      configs/policies.yaml
+      configs/factory.yaml   — factory + resources + opencode_runtime
+      configs/models.yaml    — ollama + opencode credentials + default_model
+      configs/policies.yaml  — safety policies
 
     Environment variable ``FACTORY_CONFIG_DIR`` overrides the config directory.
     """

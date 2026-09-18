@@ -38,14 +38,33 @@ class ContextBuilder:
 
     def build_request(
         self,
-        task_id: str,
-        system_prompt: str,
-        messages: list[dict[str, str]],
+        task_id: str | None = None,
+        system_prompt: str = "",
+        messages: list[dict[str, str]] | None = None,
         output_schema: dict[str, Any] | None = None,
-        model: str = "ollama:qwen2.5-coder:7b",
+        model: str | None = None,
         temperature: float = 0.1,
         project_id: str | None = None,
+        response_schema: Any | None = None,
+        **kwargs: Any,
     ) -> LLMRequest:
+        # Resolve response_schema alias if provided by specialist agents
+        if response_schema is not None and output_schema is None:
+            if hasattr(response_schema, "model_json_schema"):
+                output_schema = response_schema.model_json_schema()
+            elif isinstance(response_schema, dict):
+                output_schema = response_schema
+
+        if messages is None:
+            messages = []
+        if task_id is None:
+            task_id = kwargs.get("task_id") or f"task-{uuid.uuid4().hex[:8]}"
+
+        # Model selection: caller override → settings.models.default_model
+        # This is the single authoritative model resolution point.
+        if model is None:
+            from factory.config import get_settings
+            model = get_settings().models.default_model
         """Build the LLMRequest and save the manifest."""
         
         # We could enrich messages here with memory or file content,
