@@ -1,6 +1,14 @@
-{
+﻿{
   "$schema": "https://opencode.ai/config.json",
-  "model": "ollama/qwen2.5-coder:7b",
+  "model": "ollama/qwen3:8b-agent",
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "bash": "allow"
+  },
   "provider": {
     "ollama": {
       "npm": "@ai-sdk/openai-compatible",
@@ -9,8 +17,12 @@
         "baseURL": "http://127.0.0.1:11434/v1"
       },
       "models": {
-        "qwen2.5-coder:7b": {
-          "name": "Qwen 2.5 Coder 7B (local)"
+        "qwen3:8b-agent": {
+          "name": "Qwen3 8B Agent (local)",
+          "limit": {
+            "context": 8192,
+            "output": 8192
+          }
         }
       }
     }

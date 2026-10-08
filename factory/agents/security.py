@@ -106,10 +106,12 @@ class SecurityAgent(BaseAgent):
                     "scan_result": scan_result_data,
                     "report_path": str(self._artifact_path("security_report.json")),
                     "approved": True,
+                    "findings_count": len(proposal.vulnerabilities),
                 },
                 evidence=[{"kind": "security_report", "path": "security_report.json"}],
             )
         else:
+            vuln_strings = [v.description for v in proposal.vulnerabilities] if proposal.vulnerabilities else []
             return AgentResult(
                 agent_id=self.agent_id,
                 task_id=task.task_id,
@@ -120,7 +122,8 @@ class SecurityAgent(BaseAgent):
                     "scan_result": scan_result_data,
                     "report_path": str(self._artifact_path("security_report.json")),
                     "approved": False,
+                    "findings_count": len(proposal.vulnerabilities),
                 },
-                errors=proposal.vulnerabilities or ["Security scan rejected by LLM."],
+                errors=vuln_strings or ["Security scan rejected by LLM."],
                 evidence=[{"kind": "security_report", "path": "security_report.json"}],
             )

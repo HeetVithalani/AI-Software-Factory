@@ -106,7 +106,7 @@ class DocumentationAgent(BaseAgent):
             return self._fail(task, f"Failed to parse LLM output: {exc}")
 
         write_result = fs.write(
-            Path("README.md"), proposal.readme_content.encode("utf-8"), task_id=task.task_id
+            Path("README.md"), proposal.readme_content, task_id=task.task_id
         )
 
         if not write_result.success:
