@@ -354,16 +354,23 @@ class TestQualityGate:
     def test_threshold_allows_some_failures(self):
         from factory.projects.quality import QualityGate
         gate = QualityGate({"max_failing_tests": 3})
-        result = gate.evaluate(test_result=self._failing_test_result())
-        # 2 failures <= 3 threshold → passes
+        result = gate.evaluate(
+            test_result=self._failing_test_result(),
+            scan_result=self._clean_scan_result(),
+        )
+        # 2 failures <= 3 threshold → passes (both evidences present)
         assert result.passed
 
-    def test_no_inputs_vacuously_passes(self):
+    def test_no_inputs_fails_closed(self):
+        """T3+T4/COR-005/COR-006: no evidence at all must FAIL, never vacuous pass."""
         from factory.projects.quality import QualityGate
         gate = QualityGate()
         result = gate.evaluate()
-        assert result.passed
-        assert result.score == 100.0
+        assert not result.passed
+        assert result.score != 100.0
+        assert result.failures
+        assert any("test" in f.lower() for f in result.failures)
+        assert any("security" in f.lower() for f in result.failures)
 
     def test_checks_recorded_in_result(self):
         from factory.projects.quality import QualityGate
@@ -385,12 +392,14 @@ class TestQualityGate:
         assert not result.passed
         assert 0.0 < result.score < 100.0
 
-    def test_evaluate_from_reports_missing_files(self, tmp_path):
+    def test_evaluate_from_reports_missing_files_fails_closed(self, tmp_path):
+        """T3+T4/COR-005/COR-006: absent report files must fail the gate."""
         from factory.projects.quality import QualityGate
         gate = QualityGate()
-        # No report files → vacuously passes
+        # No report files → evidence missing → gate must fail
         result = gate.evaluate_from_reports(tmp_path)
-        assert result.passed
+        assert not result.passed
+        assert result.failures
 
     def test_evaluate_from_reports_reads_json_files(self, tmp_path):
         from factory.projects.quality import QualityGate
@@ -418,3 +427,144 @@ class TestQualityGate:
         assert "score" in d
         assert "failures" in d
         assert "checks" in d
+
+    # -----------------------------------------------------------------------
+    # T1 — zero collected tests (COR-001, downstream of TestingTool rc=5)
+    # -----------------------------------------------------------------------
+
+    def test_zero_collected_tests_evidence_fails_gate(self):
+        """T1/COR-001: evidence of zero collected tests must fail the gate,
+        even when the parser marks it all_passed=True."""
+        from factory.projects.quality import QualityGate
+        # Exact shape produced by TestResult.to_dict() for a pytest rc=5 run.
+        zero_collected = {
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "warnings": 0,
+            "duration_s": 0.01,
+            "all_passed": True,
+            "raw_summary": "no tests ran in 0.01s",
+            "failing_tests": [],
+            "collection_errors": [],
+        }
+        gate = QualityGate()
+        result = gate.evaluate(
+            test_result=zero_collected,
+            scan_result=self._clean_scan_result(),
+        )
+        assert not result.passed
+        assert result.score != 100.0
+        assert any("test" in f.lower() for f in result.failures)
+
+    # -----------------------------------------------------------------------
+    # T3 — missing / malformed test evidence (COR-005)
+    # -----------------------------------------------------------------------
+
+    def test_missing_test_evidence_fails(self):
+        """T3/COR-005: test_result=None must fail even with clean scan evidence."""
+        from factory.projects.quality import QualityGate
+        gate = QualityGate()
+        result = gate.evaluate(
+            test_result=None,
+            scan_result=self._clean_scan_result(),
+        )
+        assert not result.passed
+        assert result.score != 100.0
+        assert any("test" in f.lower() for f in result.failures)
+
+    def test_malformed_test_evidence_fails(self):
+        """T3/COR-005: test evidence missing required keys must fail, not pass by defaults."""
+        from factory.projects.quality import QualityGate
+        gate = QualityGate()
+        for bad in ({}, {"foo": "bar"}, {"passed": 10}):
+            result = gate.evaluate(
+                test_result=bad,
+                scan_result=self._clean_scan_result(),
+            )
+            assert not result.passed, f"malformed test evidence {bad!r} must fail the gate"
+            assert any("test" in f.lower() for f in result.failures)
+
+    def test_non_dict_test_evidence_fails_controlled(self):
+        """T3/COR-005: non-dict test evidence must fail the gate, not raise."""
+        from factory.projects.quality import QualityGate
+        gate = QualityGate()
+        result = gate.evaluate(
+            test_result="not a dict",
+            scan_result=self._clean_scan_result(),
+        )
+        assert not result.passed
+
+    # -----------------------------------------------------------------------
+    # T4 — missing / malformed security-scan evidence (COR-006)
+    # -----------------------------------------------------------------------
+
+    def test_missing_scan_evidence_fails(self):
+        """T4/COR-006: scan_result=None must fail even with passing test evidence."""
+        from factory.projects.quality import QualityGate
+        gate = QualityGate()
+        result = gate.evaluate(
+            test_result=self._passing_test_result(),
+            scan_result=None,
+        )
+        assert not result.passed
+        assert result.score != 100.0
+        assert any("security" in f.lower() for f in result.failures)
+
+    def test_malformed_scan_evidence_fails(self):
+        """T4/COR-006: scan evidence missing required keys must fail, not pass by defaults."""
+        from factory.projects.quality import QualityGate
+        gate = QualityGate()
+        for bad in ({}, {"finding_count": 0}):
+            result = gate.evaluate(
+                test_result=self._passing_test_result(),
+                scan_result=bad,
+            )
+            assert not result.passed, f"malformed scan evidence {bad!r} must fail the gate"
+            assert any("security" in f.lower() for f in result.failures)
+
+    def test_non_dict_scan_evidence_fails_controlled(self):
+        """T4/COR-006: non-dict scan evidence must fail the gate, not raise."""
+        from factory.projects.quality import QualityGate
+        gate = QualityGate()
+        result = gate.evaluate(
+            test_result=self._passing_test_result(),
+            scan_result=[1, 2],
+        )
+        assert not result.passed
+
+    # -----------------------------------------------------------------------
+    # T3/T4 via evaluate_from_reports (evidence-file linkage)
+    # -----------------------------------------------------------------------
+
+    def test_evaluate_from_reports_missing_security_report_fails(self, tmp_path):
+        """T4/COR-006: missing security_report.json must fail the gate."""
+        from factory.projects.quality import QualityGate
+        test_report = {"test_result": self._passing_test_result()}
+        (tmp_path / "test_report.json").write_text(json.dumps(test_report))
+        gate = QualityGate()
+        result = gate.evaluate_from_reports(tmp_path)
+        assert not result.passed
+        assert any("security" in f.lower() for f in result.failures)
+
+    def test_evaluate_from_reports_malformed_test_report_fails(self, tmp_path):
+        """T3/COR-005: malformed test_report.json must fail the gate."""
+        from factory.projects.quality import QualityGate
+        (tmp_path / "test_report.json").write_text("{ this is not valid json")
+        security_report = {"scan_result": self._clean_scan_result()}
+        (tmp_path / "security_report.json").write_text(json.dumps(security_report))
+        gate = QualityGate()
+        result = gate.evaluate_from_reports(tmp_path)
+        assert not result.passed
+        assert any("test" in f.lower() for f in result.failures)
+
+    def test_evaluate_from_reports_missing_test_result_key_fails(self, tmp_path):
+        """T3/COR-005: valid JSON without the test_result key must fail the gate."""
+        from factory.projects.quality import QualityGate
+        (tmp_path / "test_report.json").write_text(json.dumps({"unexpected": True}))
+        security_report = {"scan_result": self._clean_scan_result()}
+        (tmp_path / "security_report.json").write_text(json.dumps(security_report))
+        gate = QualityGate()
+        result = gate.evaluate_from_reports(tmp_path)
+        assert not result.passed
+        assert any("test" in f.lower() for f in result.failures)

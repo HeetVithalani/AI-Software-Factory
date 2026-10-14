@@ -227,8 +227,10 @@ class TestingTool(BaseTool):
         test_result.duration_s = duration_ms / 1000
 
         # pytest returns 0 = all passed, 1 = failures, 2 = interrupted,
-        # 3 = internal error, 4 = usage error, 5 = no tests collected
-        success = proc.returncode in (0, 5)  # 5 = no tests = not a failure
+        # 3 = internal error, 4 = usage error, 5 = no tests collected.
+        # COR-001: only exit code 0 counts as success; 5 (no tests collected)
+        # fails closed — an empty suite must never pass the gate.
+        success = proc.returncode == 0
 
         self._audit_emit("tool.testing.completed", {
             "passed": test_result.passed,

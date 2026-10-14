@@ -31,6 +31,39 @@ def _make_task(name: str = "Test Task", agent_type: str = "", description: str =
     )
 
 
+def _qa_router_lying_about_success():
+    """Mock LLM router whose QAProposal ALWAYS claims all_passed=True (T6: the LLM lies)."""
+    from factory.llm.provider import LLMResponse
+    from factory.llm.schemas.qa import QAProposal
+
+    response = LLMResponse(
+        request_id="t6-lie",
+        content="",
+        start_time=None,
+        end_time=None,
+        duration_ms=0.0,
+        success=True,
+        error="",
+        structured_data=QAProposal(
+            summary="Everything is fine, all tests passed.",
+            all_passed=True,
+            failed_tests=[],
+            suggestions=[],
+        ).model_dump(),
+    )
+
+    class _LyingRouter:
+        def complete(self, request, retry_count=0):
+            return response
+
+    return _LyingRouter()
+
+
+def _clean_scan_result() -> dict:
+    """Clean ScanResult.to_dict() shape for downstream gate checks in tests."""
+    return {"finding_count": 0, "critical_count": 0, "high_count": 0, "is_clean": True}
+
+
 # ---------------------------------------------------------------------------
 # BaseAgent
 # ---------------------------------------------------------------------------
@@ -268,6 +301,67 @@ class TestQAAgent:
         tr = report["test_result"]
         assert tr["passed"] >= 2
 
+    def test_llm_all_passed_cannot_override_deterministic_failure(self, tmp_path):
+        """T6/COR-002: an LLM claiming all_passed=True must not override real test failures."""
+        from factory.agents.qa import QAAgent
+        from factory.projects.quality import QualityGate
+        (tmp_path / "test_fail.py").write_text("def test_bad(): assert False\n")
+        agent = QAAgent(
+            workspace_root=tmp_path,
+            llm_router=_qa_router_lying_about_success(),
+            context_builder=MagicMock(),
+        )
+        task = _make_task()
+        result = agent.run(task)
+
+        # Deterministic test result wins — the agent must fail.
+        assert result.success is False
+        tr = result.outputs["test_result"]
+        assert tr["failed"] >= 1
+        assert tr["all_passed"] is False
+
+        # The report still records the LLM's (wrong) opinion as informational data,
+        # alongside the deterministic outcome.
+        report = json.loads((tmp_path / "test_report.json").read_text())
+        assert report["llm_evaluation"]["all_passed"] is True
+        assert report["success"] is False
+        assert report["test_result"]["failed"] >= 1
+
+        # The report's evidence must fail the downstream gate.
+        gate_result = QualityGate().evaluate(
+            test_result=report["test_result"],
+            scan_result=_clean_scan_result(),
+        )
+        assert gate_result.passed is False
+
+    def test_missing_test_executable_yields_controlled_failure(self, tmp_path):
+        """T5: an unusable test executable must produce a controlled agent failure,
+        never a false pass — even when the LLM claims success."""
+        from factory.agents.qa import QAAgent
+        from factory.projects.quality import QualityGate
+        agent = QAAgent(
+            workspace_root=tmp_path,
+            llm_router=_qa_router_lying_about_success(),
+            context_builder=MagicMock(),
+        )
+        task = _make_task(
+            metadata={"python_executable": "python-do-not-exist-xyz.exe"},
+        )
+        result = agent.run(task)  # must not raise
+
+        # No false pass: pytest never ran, so the agent cannot report success.
+        assert result.success is False
+        assert result.errors
+
+        # Evidence recorded by the run must not pass the downstream gate.
+        report = json.loads((tmp_path / "test_report.json").read_text())
+        assert report["success"] is False
+        gate_result = QualityGate().evaluate(
+            test_result=report["test_result"],
+            scan_result=_clean_scan_result(),
+        )
+        assert gate_result.passed is False
+
 
 # ---------------------------------------------------------------------------
 # SecurityAgent
@@ -284,13 +378,13 @@ class TestSecurityAgent:
         assert (tmp_path / "security_report.json").exists()
 
     def test_clean_workspace_has_zero_findings(self, tmp_path, mock_llm_router_with_security):
-    from factory.agents.security import SecurityAgent
-    (tmp_path / "main.py").write_text("def hello(): pass\n")
-    agent = SecurityAgent(workspace_root=tmp_path, llm_router=mock_llm_router_with_security, context_builder=MagicMock())
-    task = _make_task()
-    result = agent.run(task)
-    # The mock returns 1 vulnerability; verify findings_count is present and >= 0
-    assert result.outputs["findings_count"] >= 0
+        from factory.agents.security import SecurityAgent
+        (tmp_path / "main.py").write_text("def hello(): pass\n")
+        agent = SecurityAgent(workspace_root=tmp_path, llm_router=mock_llm_router_with_security, context_builder=MagicMock())
+        task = _make_task()
+        result = agent.run(task)
+        # The mock returns 1 vulnerability; verify findings_count is present and >= 0
+        assert result.outputs["findings_count"] >= 0
 
     def test_sensitive_file_reported(self, tmp_path, mock_llm_router_with_security):
         from factory.agents.security import SecurityAgent

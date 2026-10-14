@@ -439,13 +439,14 @@ class TestPytestParser:
 
 class TestTestingTool:
     def test_run_tests_no_tests_collected(self, tmp_path):
-        """pytest with no tests returns 5 (no tests collected) — we treat as success."""
+        """T1/COR-001: pytest return code 5 (no tests collected) must be a FAILURE."""
         import sys
         from factory.tools.testing import TestingTool
         tool = TestingTool(workspace_root=tmp_path, python_executable=sys.executable)
         result = tool.run_tests()
-        # no tests in empty dir → returncode 5 → success=True
-        assert result.success or result.returncode == 5
+        # no tests in empty dir → returncode 5 → must never count as success
+        assert result.returncode == 5
+        assert result.success is False
 
     def test_run_tests_with_passing_test(self, tmp_path):
         import sys
@@ -485,6 +486,69 @@ class TestTestingTool:
 
         assert "errors" in tr
         assert "all_passed" in tr
+
+    def test_genuinely_failing_test_remains_failure(self, tmp_path):
+        """T2: a real failing test must fail the tool result AND the quality gate."""
+        import sys
+        from factory.projects.quality import QualityGate
+        from factory.tools.testing import TestingTool
+        (tmp_path / "test_boom.py").write_text("def test_boom(): assert 1 == 2\n")
+        tool = TestingTool(workspace_root=tmp_path, python_executable=sys.executable)
+        result = tool.run_tests()
+        assert result.returncode == 1
+        assert result.success is False
+        tr = result.metadata["test_result"]
+        assert tr["failed"] >= 1
+        assert tr["all_passed"] is False
+        # The same evidence must fail the gate (clean scan so only tests decide).
+        gate = QualityGate()
+        gate_result = gate.evaluate(
+            test_result=tr,
+            scan_result={"finding_count": 0, "critical_count": 0, "high_count": 0, "is_clean": True},
+        )
+        assert gate_result.passed is False
+        assert any("Tests" in f for f in gate_result.failures)
+
+    def test_missing_python_executable_returns_controlled_failure(self, tmp_path):
+        """T5: a missing test executable must fail in a controlled way (no exception)."""
+        from factory.tools.testing import TestingTool
+        tool = TestingTool(
+            workspace_root=tmp_path,
+            python_executable="python-do-not-exist-xyz.exe",
+        )
+        result = tool.run_tests()  # must not raise
+        assert result.success is False
+        assert result.error
+        assert "not found" in result.error.lower()
+
+    def test_unusable_python_executable_returns_controlled_failure(self, tmp_path):
+        """T5: a non-executable file used as interpreter must fail in a controlled way."""
+        from factory.tools.testing import TestingTool
+        bogus = tmp_path / "not_an_interpreter.txt"
+        bogus.write_text("this is not an interpreter")
+        tool = TestingTool(workspace_root=tmp_path, python_executable=str(bogus))
+        result = tool.run_tests()  # must not raise
+        assert result.success is False
+        assert result.error
+
+    def test_tool_failure_evidence_fails_gate(self, tmp_path):
+        """T5→T3: evidence from a failed tool run must never pass the gate."""
+        from factory.projects.quality import QualityGate
+        from factory.tools.testing import TestingTool
+        tool = TestingTool(
+            workspace_root=tmp_path,
+            python_executable="python-do-not-exist-xyz.exe",
+        )
+        result = tool.run_tests()
+        assert result.success is False
+        # Same lookup the QA agent uses — a failed run yields no usable evidence.
+        evidence = result.metadata.get("test_result", {})
+        gate = QualityGate()
+        gate_result = gate.evaluate(
+            test_result=evidence,
+            scan_result={"finding_count": 0, "critical_count": 0, "high_count": 0, "is_clean": True},
+        )
+        assert gate_result.passed is False
 
 
 # ---------------------------------------------------------------------------

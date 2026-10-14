@@ -95,10 +95,18 @@ class QAAgent(BaseAgent):
 
         self._emit("agent.qa.completed", {
             "task_id": task.task_id,
-            "all_passed": proposal.all_passed,
+            "all_passed": result.success,
+            "llm_all_passed": proposal.all_passed,
         })
 
-        if proposal.all_passed:
+        # COR-002: the deterministic tool outcome decides success. The LLM
+        # verdict (all_passed, summary, failed_tests, suggestions) is
+        # informational only — it is recorded in the report and outputs but
+        # can never flip a failed run (failures, tool error, rc=5/no tests)
+        # into a QA success.
+        deterministic_pass = bool(result.success)
+
+        if deterministic_pass:
             return self._ok(
                 task,
                 summary=proposal.summary,
@@ -106,6 +114,7 @@ class QAAgent(BaseAgent):
                     "test_result": test_result_data,
                     "report_path": str(self._artifact_path("test_report.json")),
                     "all_passed": True,
+                    "llm_all_passed": proposal.all_passed,
                 },
                 evidence=[{"kind": "test_result", "path": "test_report.json"}],
             )
@@ -120,7 +129,11 @@ class QAAgent(BaseAgent):
                     "test_result": test_result_data,
                     "report_path": str(self._artifact_path("test_report.json")),
                     "all_passed": False,
+                    "llm_all_passed": proposal.all_passed,
                 },
-                errors=["Tests failed or QA rejected the test suite."],
+                errors=[
+                    f"Deterministic test run failed (pytest returncode={result.returncode}); "
+                    "the LLM verdict is recorded in the report but cannot override it."
+                ],
                 evidence=[{"kind": "test_result", "path": "test_report.json"}],
             )

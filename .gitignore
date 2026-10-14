@@ -29,8 +29,8 @@ models/
 # Factory backups
 factory-backup-before-git-policy/
 
-# Project workspaces
-projects/
+# Project workspaces (repository root only — do not match factory/projects/)
+/projects/
 
 # Local secrets / environment
 .env
