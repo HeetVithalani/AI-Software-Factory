@@ -64,6 +64,34 @@ def _clean_scan_result() -> dict:
     return {"finding_count": 0, "critical_count": 0, "high_count": 0, "is_clean": True}
 
 
+def _security_router_approving():
+    """Mock LLM router whose SecurityProposal ALWAYS claims approved=True (COR-007: the LLM lies)."""
+    from factory.llm.provider import LLMResponse
+    from factory.llm.schemas.security import SecurityProposal
+
+    response = LLMResponse(
+        request_id="cor007-lie",
+        content="",
+        start_time=None,
+        end_time=None,
+        duration_ms=0.0,
+        success=True,
+        error="",
+        structured_data=SecurityProposal(
+            summary="Everything is fine.",
+            approved=True,
+            vulnerabilities=[],
+            risks=[],
+        ).model_dump(),
+    )
+
+    class _ApprovingRouter:
+        def complete(self, request, retry_count=0):
+            return response
+
+    return _ApprovingRouter()
+
+
 # ---------------------------------------------------------------------------
 # BaseAgent
 # ---------------------------------------------------------------------------
@@ -393,6 +421,59 @@ class TestSecurityAgent:
         task = _make_task()
         result = agent.run(task)
         assert result.outputs["findings_count"] >= 1
+
+    def test_llm_approval_cannot_override_deterministic_findings(self, tmp_path):
+        """COR-007 regression: an approving LLM must not flip a dirty scan to success."""
+        from factory.agents.security import SecurityAgent
+        (tmp_path / ".env").write_text("SECRET=abc123\n")
+        agent = SecurityAgent(workspace_root=tmp_path, llm_router=_security_router_approving(), context_builder=MagicMock())
+        task = _make_task()
+        result = agent.run(task)
+        # Deterministic scan found a secret: release must fail regardless of the LLM verdict.
+        assert result.success is False
+        # The failure reason names the deterministic finding, not an LLM opinion.
+        assert any(".env" in e for e in result.errors), result.errors
+        assert result.outputs["approved"] is False
+        # The LLM verdict is recorded, but it is informational only.
+        assert result.outputs["llm_approved"] is True
+        assert result.outputs["findings_count"] >= 1
+        # The persisted report must agree with the AgentResult: the scan RAN
+        # (scan_completed=True) but the deterministic policy REJECTED it,
+        # while the advisory LLM verdict said approve.
+        report = json.loads((tmp_path / "security_report.json").read_text())
+        assert report["scan_completed"] is True
+        assert report["deterministic_approved"] is False
+        assert report["llm_approved"] is True
+
+    def test_missing_scan_evidence_cannot_produce_success(self, tmp_path, monkeypatch):
+        """Missing scan evidence must fail closed even when the LLM approves."""
+        from factory.agents.security import SecurityAgent
+        from factory.tools.base import ToolResult
+
+        class _BrokenSecurityTool:
+            tool_name = "security"
+
+            def scan_directory(self, path=None, *, recursive=True, task_id=None):
+                return ToolResult(success=False, error="scanner crashed")
+
+        monkeypatch.setattr(
+            SecurityAgent, "_make_security_tool", lambda self: _BrokenSecurityTool()
+        )
+        agent = SecurityAgent(workspace_root=tmp_path, llm_router=_security_router_approving(), context_builder=MagicMock())
+        task = _make_task()
+        result = agent.run(task)
+        assert result.success is False
+        # The failure reason must come from the injected scan failure, not
+        # from an unrelated error path.
+        assert any(
+            "did not complete" in e and "scanner crashed" in e for e in result.errors
+        ), result.errors
+        # Report artifact is still written for the evidence trail and must
+        # record the failed execution and the failed deterministic decision.
+        report = json.loads((tmp_path / "security_report.json").read_text())
+        assert report["success"] is False
+        assert report["scan_completed"] is False
+        assert report["deterministic_approved"] is False
 
     def test_no_workspace_fails(self):
         from factory.agents.security import SecurityAgent

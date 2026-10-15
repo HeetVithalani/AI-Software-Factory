@@ -23,8 +23,13 @@ class SecurityAgent(BaseAgent):
     Runs a full security scan of the workspace using SecurityTool.
 
     Produces security_report.json with all findings.
-    Returns success=True even with findings (findings are informational
-    Runs security scanning tools and uses the LLM to evaluate the findings.
+
+    Success is decided by the deterministic scan alone (COR-007): the scan
+    must complete, its evidence must be well-formed, and it must report zero
+    critical/high findings (the QualityGate ``max_security_findings = 0``
+    rule). The LLM evaluation (approved flag, vulnerabilities) is recorded
+    in the report as informational evidence and never flips the decision
+    in either direction.
     """
     agent_type = "security"
 
@@ -75,11 +80,72 @@ class SecurityAgent(BaseAgent):
         except Exception as exc:
             return self._fail(task, f"Failed to parse LLM output: {exc}")
 
+        # ------------------------------------------------------------------
+        # COR-007: the deterministic scan decides success; the LLM verdict is
+        # informational only (same principle as the COR-002 fix in qa.py).
+        # The rule mirrors QualityGate's default (max_security_findings = 0):
+        # the scan must complete, its evidence must be well-formed, and it
+        # must report zero critical/high findings. An approving LLM cannot
+        # override a dirty scan, and a rejecting LLM cannot fail a clean one.
+        #
+        # The decision is computed BEFORE the report is written so that the
+        # persisted report, the AgentResult and the emitted event always
+        # agree on it.
+        # ------------------------------------------------------------------
+        critical = scan_result_data.get("critical_count")
+        high = scan_result_data.get("high_count")
+        evidence_present = (
+            isinstance(critical, int)
+            and isinstance(high, int)
+            and critical >= 0
+            and high >= 0
+        )
+
+        if not result.success:
+            deterministic_pass = False
+            decision_errors = [
+                "Security scan did not complete: "
+                + (result.error or "no scan evidence produced.")
+            ]
+        elif not evidence_present:
+            deterministic_pass = False
+            decision_errors = [
+                "Malformed security-scan evidence: critical_count/high_count "
+                "missing from the scan result."
+            ]
+        elif critical + high > 0:
+            deterministic_pass = False
+            high_findings = [
+                f
+                for f in (scan_result_data.get("findings") or [])
+                if isinstance(f, dict)
+                and f.get("severity") in ("high", "critical")
+            ]
+            decision_errors = [
+                f"{f.get('path', '?')}: "
+                + ("; ".join(f.get("reasons") or []) or "sensitive data")
+                + f" [{f.get('severity')}]"
+                for f in high_findings
+            ] or ["Security scan reported critical/high findings."]
+        else:
+            deterministic_pass = True
+            decision_errors = []
+
+        findings_count = scan_result_data.get("finding_count", 0)
+
         report = {
             "task_id": task.task_id,
             "project_id": task.project_id,
             "scan_target": scan_target,
+            # Legacy field, kept for compatibility: historically the scanner
+            # execution status. It is True whenever the deterministic scan
+            # RAN — even when blocking findings were discovered. Use
+            # `deterministic_approved` for the release decision and
+            # `scan_completed` for the execution status.
             "success": result.success,
+            "scan_completed": result.success,
+            "deterministic_approved": deterministic_pass,
+            "llm_approved": proposal.approved,
             "returncode": result.returncode,
             "scan_result": scan_result_data,
             "llm_evaluation": proposal.model_dump(),
@@ -95,35 +161,33 @@ class SecurityAgent(BaseAgent):
 
         self._emit("agent.security.completed", {
             "task_id": task.task_id,
-            "approved": proposal.approved,
+            "approved": deterministic_pass,
+            "llm_approved": proposal.approved,
         })
 
-        if proposal.approved:
+        outputs = {
+            "scan_result": scan_result_data,
+            "report_path": str(self._artifact_path("security_report.json")),
+            "approved": deterministic_pass,
+            "llm_approved": proposal.approved,
+            "findings_count": findings_count,
+        }
+        evidence = [{"kind": "security_report", "path": "security_report.json"}]
+
+        if deterministic_pass:
             return self._ok(
                 task,
                 summary=proposal.summary,
-                outputs={
-                    "scan_result": scan_result_data,
-                    "report_path": str(self._artifact_path("security_report.json")),
-                    "approved": True,
-                    "findings_count": len(proposal.vulnerabilities),
-                },
-                evidence=[{"kind": "security_report", "path": "security_report.json"}],
+                outputs=outputs,
+                evidence=evidence,
             )
-        else:
-            vuln_strings = [v.description for v in proposal.vulnerabilities] if proposal.vulnerabilities else []
-            return AgentResult(
-                agent_id=self.agent_id,
-                task_id=task.task_id,
-                project_id=task.project_id or self._project_id,
-                success=False,
-                summary=proposal.summary,
-                outputs={
-                    "scan_result": scan_result_data,
-                    "report_path": str(self._artifact_path("security_report.json")),
-                    "approved": False,
-                    "findings_count": len(proposal.vulnerabilities),
-                },
-                errors=vuln_strings or ["Security scan rejected by LLM."],
-                evidence=[{"kind": "security_report", "path": "security_report.json"}],
-            )
+        return AgentResult(
+            agent_id=self.agent_id,
+            task_id=task.task_id,
+            project_id=task.project_id or self._project_id,
+            success=False,
+            summary=proposal.summary,
+            outputs=outputs,
+            errors=decision_errors,
+            evidence=evidence,
+        )
