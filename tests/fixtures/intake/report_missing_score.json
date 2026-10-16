@@ -1,0 +1,8 @@
+{
+  "skill": "demo-skill",
+  "scanned_at": "2026-01-05T00:00:00Z",
+  "scanner": "skillspector",
+  "severity": "LOW",
+  "recommendation": "SAFE",
+  "findings": []
+}

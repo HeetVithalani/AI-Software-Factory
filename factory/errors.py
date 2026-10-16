@@ -187,3 +187,49 @@ class ToolTimeoutError(ToolError):
 class PathSandboxError(ToolError):
     """Raised when a tool attempts to access a path outside the allowed sandbox."""
     code = "PATH_SANDBOX"
+
+
+# ---------------------------------------------------------------------------
+# Tool intake (Phase 2a)
+# ---------------------------------------------------------------------------
+
+class IntakeError(FactoryError):
+    """Generic error for the trusted tool/skill intake workflow."""
+    code = "INTAKE_ERROR"
+
+
+class IntakeFetchError(IntakeError):
+    """Raised when a quarantined artifact cannot be fetched or extracted."""
+    code = "INTAKE_FETCH"
+
+
+class IntakeScanError(IntakeError):
+    """
+    Raised when the scanner boundary fails closed: scanner missing,
+    timeout, nonzero exit, missing/malformed/incomplete report.
+    """
+    code = "INTAKE_SCAN"
+
+
+class IntakePolicyError(IntakeError):
+    """Raised when a deterministic intake policy decision blocks an action."""
+    code = "INTAKE_POLICY"
+
+
+class IntakeIntegrityError(IntakeError):
+    """Raised when recorded hashes no longer match on-disk content (tamper/drift)."""
+    code = "INTAKE_INTEGRITY"
+
+
+class IntakeStateError(IntakeError):
+    """Raised on an invalid lifecycle transition (e.g. install before approval)."""
+    code = "INTAKE_STATE"
+
+
+class IntakeInstallError(IntakeError):
+    """
+    Raised when the install destination fails a pre-write safety check
+    (e.g. the install root is not git-ignored). Fail-closed: nothing is
+    written when this is raised.
+    """
+    code = "INTAKE_INSTALL"

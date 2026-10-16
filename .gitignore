@@ -52,3 +52,6 @@ Thumbs.db
 *.backup
 *.bak
 
+# Installed tools (intake install root — installed skills are inert/unloaded)
+knowledge/tools/
+

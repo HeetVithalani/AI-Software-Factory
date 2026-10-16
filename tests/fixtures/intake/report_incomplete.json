@@ -1,0 +1,10 @@
+{
+  "skill": "demo-skill",
+  "scanned_at": "2026-01-03T00:00:00Z",
+  "scanner": "skillspector",
+  "status": "incomplete",
+  "risk_score": 10,
+  "severity": "LOW",
+  "recommendation": "SAFE",
+  "findings": []
+}

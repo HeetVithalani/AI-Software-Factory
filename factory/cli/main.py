@@ -10,6 +10,7 @@ Commands:
   factory approvals show  <request_id>
   factory approvals grant <request_id> [--note "reason"]
   factory approvals deny  <request_id> [--note "reason"]
+  factory intake discover|fetch|scan|check|approve|install|status|disable
 """
 
 import argparse
@@ -37,6 +38,10 @@ from factory.cli.plan_loader import (
 from factory.cli.approvals_cmd import (
     register_approvals_subparser,
     dispatch_approvals,
+)
+from factory.cli.intake_cmd import (
+    register_intake_subparser,
+    dispatch_intake,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,6 +187,9 @@ def main() -> int:
     # Approvals sub-command
     register_approvals_subparser(subparsers)
 
+    # Tool/skill intake sub-command (Phase 2a)
+    register_intake_subparser(subparsers)
+
     args = parser.parse_args()
 
     settings = get_settings()
@@ -193,6 +201,8 @@ def main() -> int:
         return run_project(args.project_path, args.task_desc, args.plan)
     elif args.command == "approvals":
         return dispatch_approvals(args)
+    elif args.command == "intake":
+        return dispatch_intake(args)
 
     return 1
 

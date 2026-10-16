@@ -289,3 +289,125 @@ class AgentResult(BaseModel):
     produced_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool intake (Phase 2a)
+# ---------------------------------------------------------------------------
+
+class ToolKind(str, Enum):
+    """Kinds of integrations the intake workflow can process."""
+    AGENT_SKILL = "agent_skill"
+    MCP_SERVER = "mcp_server"
+    CLI_TOOL = "cli_tool"
+    PYTHON_PACKAGE = "python_package"
+    BROWSER_TOOL = "browser_tool"
+    STANDALONE_APP = "standalone_app"
+
+
+class IntakeStatus(str, Enum):
+    """
+    Lifecycle states for a logical tool (mirrors its latest revision).
+
+    DISCOVERED ─▶ QUARANTINED ─▶ SCANNED ─▶ PENDING_APPROVAL ─▶ APPROVED ─▶ INSTALLED
+         │              │            │
+         ▼              ▼            ▼
+  DISCOVERY_FAILED   (fetch       SCAN_FAILED
+                      errors)         │
+    Failure/governance states: REJECTED (policy), STALE (content drift),
+    REVOKED (human disable). Installed skills remain disabled/unloaded:
+    Phase 2a has no mechanism that loads installed skills into any agent.
+    """
+    DISCOVERED = "discovered"
+    DISCOVERY_FAILED = "discovery_failed"
+    QUARANTINED = "quarantined"
+    SCANNED = "scanned"
+    SCAN_FAILED = "scan_failed"
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED = "approved"
+    INSTALLED = "installed"
+    REJECTED = "rejected"
+    STALE = "stale"
+    REVOKED = "revoked"
+
+
+class ScanState(str, Enum):
+    """Outcome of the deterministic scanner boundary for one revision."""
+    NOT_RUN = "not_run"
+    CLEAN = "clean"           # completed scan, zero findings
+    FINDINGS = "findings"     # completed scan, >=1 finding (not a scan failure)
+    FAILED = "failed"         # timeout / nonzero exit / missing or malformed report
+    UNAVAILABLE = "unavailable"  # scanner executable not installed/configured
+
+
+class ToolRecord(BaseModel):
+    """Persistent logical-tool identity stored in tool_registry."""
+    model_config = {"use_enum_values": True}
+
+    tool_id: str
+    kind: ToolKind
+    name: str
+    source_url: str
+    license_declared: str | None = None
+    license_source: str = "unknown"
+    capabilities: list[str] = Field(default_factory=list)
+    broker_categories: list[str] = Field(default_factory=list)
+    status: IntakeStatus = IntakeStatus.DISCOVERED
+    install_path: str | None = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+class ToolRevision(BaseModel):
+    """Persistent, immutable-per-SHA record for one pinned revision."""
+    model_config = {"use_enum_values": True}
+
+    revision_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    tool_id: str
+    revision_sha: str
+    artifact_sha256: str | None = None
+    tree_sha256: str | None = None
+    quarantine_path: str | None = None
+    scan_state: ScanState = ScanState.NOT_RUN
+    scan_report_path: str | None = None
+    scan_report_sha256: str | None = None
+    scanner_identity: str | None = None
+    risk_score: int | None = None
+    severity: str | None = None
+    recommendation: str | None = None
+    unresolved_findings: int = 0
+    policy_decision: str | None = None
+    policy_reasons: list[dict[str, Any]] = Field(default_factory=list)
+    approval_request_id: str | None = None
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    approval_artifact_sha256: str | None = None
+    approval_report_sha256: str | None = None
+    installed_at: datetime | None = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    def clear_approval(self) -> None:
+        """Invalidate any recorded approval binding (tamper/drift/stale)."""
+        self.approval_request_id = None
+        self.approved_by = None
+        self.approved_at = None
+        self.approval_artifact_sha256 = None
+        self.approval_report_sha256 = None
+
+    @property
+    def approval_bound(self) -> bool:
+        """True when an approval exists and is bound to concrete hashes."""
+        return bool(
+            self.approval_request_id
+            and self.approval_artifact_sha256
+            and self.approval_report_sha256
+        )

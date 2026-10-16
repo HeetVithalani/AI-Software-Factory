@@ -31,6 +31,7 @@ NON_NEGOTIABLE: frozenset[str] = frozenset({
     "require_approval_high_risk",
     "block_sensitive_to_remote",
     "production_deployment_forbidden",
+    "require_approval_tool_install",
 })
 
 
@@ -47,6 +48,14 @@ class PolicySet:
     require_approval_high_risk: bool = True
     block_sensitive_to_remote: bool = True
     production_deployment_forbidden: bool = True
+    # Tool/skill installation is never auto-approved (Phase 2a intake).
+    # Intentionally DECLARATIVE (L2): factory.intake.service enforces
+    # approval unconditionally (recorded approval binding + clean scan +
+    # hash integrity) and never reads this flag at runtime - consulting it
+    # as a gate could only weaken the non-negotiable requirement. The flag
+    # asserts/documents the policy (listed in NON_NEGOTIABLE, cannot be
+    # weakened by project config).
+    require_approval_tool_install: bool = True
     require_approval_knowledge_high_impact: bool = True
     max_task_retries: int = 3
     auto_approve_inherited: bool = True

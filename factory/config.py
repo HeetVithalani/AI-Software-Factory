@@ -130,6 +130,35 @@ class PolicySettings:
     max_task_retries: int = 3
     # Production deployment is always outside factory authority
     production_deployment_forbidden: bool = True
+    # Tool/skill installation is never auto-approved (Phase 2a intake).
+    # Intentionally DECLARATIVE (L2): enforcement lives unconditionally in
+    # factory.intake.service (install requires a recorded approval binding,
+    # a completed clean scan, and hash integrity - no flag consulted).
+    # Reading this as a runtime gate could only WEAKEN that non-negotiable
+    # requirement, so the flag documents/asserts project policy (it is in
+    # NON_NEGOTIABLE and cannot be set False) rather than gating code.
+    require_approval_tool_install: bool = True
+
+
+@dataclass
+class IntakeSettings:
+    """
+    Trusted tool/skill intake configuration (Phase 2a).
+
+    Roots default to git-ignored directories (cache/, knowledge/). The
+    service verifies the quarantine root is actually git-ignored before
+    writing any artifact. Caps bound archive downloads and extractions.
+    """
+    quarantine_root: str = str(CACHE_DIR / "tool-quarantine")
+    install_root: str = str(KNOWLEDGE_DIR / "tools")
+    total_cap_bytes: int = 2 * 1024 * 1024 * 1024      # 2 GiB quarantine cap
+    max_archive_bytes: int = 64 * 1024 * 1024          # 64 MiB per archive
+    max_extracted_bytes: int = 256 * 1024 * 1024       # 256 MiB extracted
+    max_file_count: int = 10_000
+    max_path_length: int = 240                         # Windows-safe path cap
+    fetch_timeout_seconds: int = 60
+    scan_timeout_seconds: int = 300
+    skillspector_executable: str = "skillspector"
 
 
 @dataclass
@@ -142,6 +171,7 @@ class FullSettings:
     opencode_runtime: OpenCodeRuntimeSettings = field(
         default_factory=OpenCodeRuntimeSettings
     )
+    intake: IntakeSettings = field(default_factory=IntakeSettings)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +246,30 @@ def _apply_factory_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
     if "manage_server" in ocr:
         ort.manage_server = bool(ocr["manage_server"])
 
+    # Tool intake (Phase 2a) — quarantine/install roots, caps, timeouts
+    it = data.get("intake", {})
+    its = settings.intake
+    if "quarantine_root" in it:
+        its.quarantine_root = str(it["quarantine_root"])
+    if "install_root" in it:
+        its.install_root = str(it["install_root"])
+    if "total_cap_bytes" in it:
+        its.total_cap_bytes = int(it["total_cap_bytes"])
+    if "max_archive_bytes" in it:
+        its.max_archive_bytes = int(it["max_archive_bytes"])
+    if "max_extracted_bytes" in it:
+        its.max_extracted_bytes = int(it["max_extracted_bytes"])
+    if "max_file_count" in it:
+        its.max_file_count = int(it["max_file_count"])
+    if "max_path_length" in it:
+        its.max_path_length = int(it["max_path_length"])
+    if "fetch_timeout_seconds" in it:
+        its.fetch_timeout_seconds = int(it["fetch_timeout_seconds"])
+    if "scan_timeout_seconds" in it:
+        its.scan_timeout_seconds = int(it["scan_timeout_seconds"])
+    if "skillspector_executable" in it:
+        its.skillspector_executable = str(it["skillspector_executable"])
+
 
 def _apply_models_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
     """Apply models.yaml values onto the FullSettings instance."""
@@ -257,6 +311,7 @@ def _apply_policies_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
         "require_approval_high_risk",
         "block_sensitive_to_remote",
         "production_deployment_forbidden",
+        "require_approval_tool_install",
     }
     p = data.get("policies", {})
     for key, value in p.items():

@@ -1,0 +1,22 @@
+{
+  "skill": "demo-skill",
+  "scanned_at": "2026-01-02T00:00:00Z",
+  "scanner": "skillspector",
+  "risk_score": 78,
+  "severity": "HIGH",
+  "recommendation": "DO NOT INSTALL",
+  "findings": [
+    {
+      "id": "E2",
+      "severity": "HIGH",
+      "title": "Env Variable Harvesting",
+      "pattern": "os.environ"
+    },
+    {
+      "id": "P4",
+      "severity": "MEDIUM",
+      "title": "Behavior Manipulation",
+      "pattern": "override instructions"
+    }
+  ]
+}

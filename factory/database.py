@@ -19,7 +19,7 @@ from factory.config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
@@ -278,6 +278,80 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """
+    Add tool-intake tables (Phase 2a): logical tool identity + immutable,
+    revision-pinned records with hash-bound approval tracking.
+
+    Approval is never stored as a bare boolean: the revision row records the
+    approval request reference AND the exact artifact / scan-report hashes the
+    approval was granted against, so any byte change invalidates it.
+    """
+
+    # Logical tool identity (kind + canonical source URL => stable tool_id)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tool_registry (
+            tool_id             TEXT PRIMARY KEY,
+            kind                TEXT NOT NULL,
+            name                TEXT NOT NULL,
+            source_url          TEXT NOT NULL,
+            license_declared    TEXT,
+            license_source      TEXT NOT NULL DEFAULT 'unknown',
+            capabilities        TEXT NOT NULL DEFAULT '[]',
+            broker_categories   TEXT NOT NULL DEFAULT '[]',
+            status              TEXT NOT NULL DEFAULT 'discovered',
+            install_path        TEXT,
+            created_at          TEXT NOT NULL,
+            updated_at          TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_registry_status "
+        "ON tool_registry(status)"
+    )
+
+    # Immutable revision records (exact pinned SHA + content hashes)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tool_revisions (
+            revision_id             TEXT PRIMARY KEY,
+            tool_id                 TEXT NOT NULL
+                REFERENCES tool_registry(tool_id) ON DELETE CASCADE,
+            revision_sha            TEXT NOT NULL,
+            artifact_sha256         TEXT,
+            tree_sha256             TEXT,
+            quarantine_path         TEXT,
+            scan_state              TEXT NOT NULL DEFAULT 'not_run',
+            scan_report_path        TEXT,
+            scan_report_sha256      TEXT,
+            scanner_identity        TEXT,
+            risk_score              INTEGER,
+            severity                TEXT,
+            recommendation          TEXT,
+            unresolved_findings     INTEGER NOT NULL DEFAULT 0,
+            policy_decision         TEXT,
+            policy_reasons          TEXT NOT NULL DEFAULT '[]',
+            approval_request_id     TEXT
+                REFERENCES approvals(request_id) ON DELETE SET NULL,
+            approved_by             TEXT,
+            approved_at             TEXT,
+            approval_artifact_sha256 TEXT,
+            approval_report_sha256  TEXT,
+            installed_at            TEXT,
+            created_at              TEXT NOT NULL,
+            updated_at              TEXT NOT NULL,
+            UNIQUE (tool_id, revision_sha)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_revisions_tool "
+        "ON tool_revisions(tool_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_revisions_sha "
+        "ON tool_revisions(revision_sha)"
+    )
+
+
 def initialize_database(db_path: Path | None = None) -> None:
     """
     Create or migrate the factory database to the current schema version.
@@ -311,6 +385,13 @@ def initialize_database(db_path: Path | None = None) -> None:
             _migrate_v3(conn)
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (3,)
+            )
+
+        if current < 4:
+            logger.info("Applying schema migration v4 (tool_registry, tool_revisions)…")
+            _migrate_v4(conn)
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (4,)
             )
 
         conn.commit()
