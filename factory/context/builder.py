@@ -28,8 +28,11 @@ class ContextBuilder:
     Prevents dumping the whole project into the prompt.
     """
 
-    def __init__(self, state: FactoryState) -> None:
+    def __init__(self, state: FactoryState, skill_provider: Any = None) -> None:
         self.state = state
+        # Phase 2c: optional skill-context provider (explicit per-run
+        # integration point). None keeps pre-2c behavior byte-for-byte.
+        self.skill_provider = skill_provider
         self.persister = ContextPersister()
         
     def _estimate_tokens(self, text: str) -> int:
@@ -46,6 +49,7 @@ class ContextBuilder:
         temperature: float = 0.1,
         project_id: str | None = None,
         response_schema: Any | None = None,
+        agent_id: str | None = None,
         **kwargs: Any,
     ) -> LLMRequest:
         # Resolve response_schema alias if provided by specialist agents
@@ -66,7 +70,33 @@ class ContextBuilder:
             from factory.config import get_settings
             model = get_settings().models.default_model
         """Build the LLMRequest and save the manifest."""
-        
+
+        # Phase 2c: append explicitly project-enabled skill reference
+        # context (bounded, attributed, untrusted-framed). The agent's
+        # system prompt always comes FIRST so injected reference material
+        # can never precede or replace policy. A failing provider injects
+        # nothing rather than breaking the request.
+        if self.skill_provider is not None:
+            try:
+                selection = self.skill_provider.select(
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    task_id=task_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Skill context provider failed for task %s; continuing "
+                    "without skill context: %s", task_id, exc,
+                )
+            else:
+                if selection.block:
+                    system_prompt = (
+                        f"{system_prompt}\n\n{selection.block}"
+                        if system_prompt else selection.block
+                    )
+
         # We could enrich messages here with memory or file content,
         # but the caller (the agent) is responsible for requesting specific files.
         # This builder ensures the total size doesn't exceed bounds.

@@ -92,6 +92,7 @@ class DocumentationAgent(BaseAgent):
                 system_prompt=system_prompt,
                 messages=messages,
                 response_schema=DocumentationProposal,
+                agent_id=self.agent_type,
             )
             llm_res = self._llm.complete(req)
         except Exception as exc:

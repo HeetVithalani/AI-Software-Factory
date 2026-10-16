@@ -15,7 +15,11 @@ Commands::
                             [--manual-review --note "reason"]
     factory intake install <tool-id> --revision <sha>
     factory intake status  [<tool-id>]
-    factory intake disable <tool-id>
+    factory intake disable <tool-id>            (global revoke)
+    factory intake enable  <tool-id> --revision <sha> --project-path <dir>
+                            --note "reason" [--actor <name>]
+    factory intake unbind  <tool-id> --project-path <dir> --note "reason"
+    factory intake skills  [--project-path <dir>]
 
 Design notes (mirrors factory/cli/approvals_cmd.py conventions):
 * Human-driven throughout - no command auto-approves or auto-installs.
@@ -24,7 +28,10 @@ Design notes (mirrors factory/cli/approvals_cmd.py conventions):
 * approve prints the full evidence binding (revision, artifact hash,
   scan-report hash, scanner status, findings summary, license result,
   policy reasons) before accepting an explicit decision.
-* Installed skills stay disabled/unloaded - Phase 2a has no skill loader.
+* Installed skills are globally inert. They enter agents only as
+  untrusted reference context after an explicit per-project 'enable'
+  (Phase 2c); 'unbind' removes only the project binding and never
+  revokes or deletes the global installation.
 """
 
 from __future__ import annotations
@@ -241,7 +248,8 @@ def cmd_install(args: argparse.Namespace) -> int:
     except IntakeError as exc:
         print(f"install failed (fail-closed): {exc}", file=sys.stderr)
         return 1
-    print("[OK] Installed (content copied; NOT enabled or loaded into any agent).")
+    print("[OK] Installed (content copied; globally inert until explicitly "
+          "enabled per project with 'factory intake enable').")
     _print_summary(summary)
     print(f"  Install path: {summary.detail.get('install_path')}")
     return 0
@@ -272,7 +280,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             if rev.get("approved_by"):
                 print(f"  Approved by: {rev['approved_by']} at {rev['approved_at']}")
         if row.get("install_path"):
-            print(f"  Install:  {row['install_path']} (disabled/unloaded)")
+            print(f"  Install:  {row['install_path']} (inert until enabled per project)")
     print("-" * 60)
     return 0
 
@@ -289,6 +297,109 @@ def cmd_disable(args: argparse.Namespace) -> int:
     return 0
 
 
+def _current_actor() -> str:
+    """Best-effort operator identity for the audit record (never blocks)."""
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
+def cmd_enable(args: argparse.Namespace) -> int:
+    """Enable an installed skill revision for ONE project (Phase 2c)."""
+    from factory.skills.bindings import enable_skill
+    note = (args.note or "").strip()
+    if not note:
+        print(
+            "enable failed: a non-empty --note is mandatory (recorded in "
+            "the audit event).",
+            file=sys.stderr,
+        )
+        return 1
+    actor = (args.actor or "").strip() or _current_actor()
+    from factory.audit.logger import AuditLogger
+    try:
+        binding = enable_skill(
+            args.tool_id,
+            args.revision,
+            args.project_path,
+            note=note,
+            actor=actor,
+            audit_logger=AuditLogger(),
+        )
+    except IntakeError as exc:
+        print(f"enable failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"[OK] Skill enabled for project {binding.project_key} ONLY.")
+    print("  Reference context only: never executed, untrusted, and it "
+          "grants no tool or broker capability.")
+    print(f"  Tool:     {binding.tool_id}")
+    print(f"  Revision: {binding.revision_sha}")
+    print(f"  Actor:    {binding.actor}")
+    print(f"  Note:     {binding.note}")
+    return 0
+
+
+def cmd_unbind(args: argparse.Namespace) -> int:
+    """Remove a project's skill binding; the global install is untouched."""
+    from factory.skills.bindings import disable_skill
+    note = (args.note or "").strip()
+    if not note:
+        print(
+            "unbind failed: a non-empty --note is mandatory (recorded in "
+            "the audit event).",
+            file=sys.stderr,
+        )
+        return 1
+    actor = (args.actor or "").strip() or _current_actor()
+    from factory.audit.logger import AuditLogger
+    try:
+        binding = disable_skill(
+            args.tool_id,
+            args.project_path,
+            note=note,
+            actor=actor,
+            audit_logger=AuditLogger(),
+        )
+    except IntakeError as exc:
+        print(f"unbind failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"[OK] Skill binding removed for project {binding.project_key}.")
+    print("  The global installation is unchanged (not revoked, not deleted).")
+    return 0
+
+
+def cmd_skills(args: argparse.Namespace) -> int:
+    """Inspect installed skills and (optionally) a project's bindings."""
+    from factory.skills.bindings import (
+        list_bindings,
+        list_installed_skills,
+        project_key_for,
+    )
+    tools = list_installed_skills()
+    print(
+        "Installed skills (globally inert; reference context only, and "
+        "only after an explicit per-project enable):"
+    )
+    if not tools:
+        print("  (none installed)")
+    for t in tools:
+        print(f"  - {t.tool_id}  '{t.name}'")
+        print(f"      install path: {t.install_path}")
+    project_path = getattr(args, "project_path", None)
+    if project_path:
+        key = project_key_for(project_path)
+        print(f"Enabled for project {key}:")
+        bindings = list_bindings(key)
+        if not bindings:
+            print("  (no enabled skills)")
+        for b in bindings:
+            print(f"  - {b.tool_id}@{b.revision_sha}")
+            print(f"      enabled by {b.actor}: {b.note}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Parser registration (mirrors approvals_cmd conventions)
 # ---------------------------------------------------------------------------
@@ -300,7 +411,8 @@ def register_intake_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Trusted tool/skill intake (discover -> fetch -> scan -> check -> approve -> install)",
         description=(
             "Revision-pinned, hash-bound, fail-closed intake for external "
-            "tools and agent skills. Installed skills remain disabled."
+            "tools and agent skills. Installed skills stay globally inert; "
+            "per-project 'enable' grants untrusted reference context only."
         ),
         epilog=(
             "example:\n"
@@ -370,6 +482,42 @@ def register_intake_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     x.add_argument("tool_id", help="Tool id to revoke")
 
+    # --- enable (Phase 2c: per-project runtime reference context) ---
+    e = intake_sub.add_parser(
+        "enable",
+        help="Enable an installed skill revision for ONE project (untrusted reference context)",
+    )
+    e.add_argument("tool_id", help="Tool id from discover")
+    e.add_argument("--revision", required=True,
+                   help="Exact 40-character SHA of the INSTALLED revision")
+    e.add_argument("--project-path", required=True,
+                   help="Resolved project workspace directory - the SAME "
+                        "path passed to 'factory run <project_path>'")
+    e.add_argument("--note", default="",
+                   help="Mandatory audit note (recorded verbatim)")
+    e.add_argument("--actor", default="",
+                   help="Operator identity (default: current OS user)")
+
+    # --- unbind (Phase 2c: project-scoped disable; never a global revoke) ---
+    u = intake_sub.add_parser(
+        "unbind",
+        help="Remove a project's skill binding (global install untouched)",
+    )
+    u.add_argument("tool_id", help="Tool id to unbind for this project")
+    u.add_argument("--project-path", required=True,
+                   help="Resolved project workspace directory")
+    u.add_argument("--note", default="",
+                   help="Mandatory audit note/reason")
+    u.add_argument("--actor", default="",
+                   help="Operator identity (default: current OS user)")
+
+    # --- skills (Phase 2c: inspection) ---
+    sk = intake_sub.add_parser(
+        "skills", help="Inspect installed skills and their project bindings",
+    )
+    sk.add_argument("--project-path", default=None,
+                    help="Also list the bindings enabled for this project")
+
 
 def dispatch_intake(args: argparse.Namespace) -> int:
     """Route to the correct intake sub-command handler."""
@@ -386,6 +534,9 @@ def dispatch_intake(args: argparse.Namespace) -> int:
         "install": cmd_install,
         "status": cmd_status,
         "disable": cmd_disable,
+        "enable": cmd_enable,
+        "unbind": cmd_unbind,
+        "skills": cmd_skills,
     }
     handler = handlers.get(cmd)
     if handler is None:

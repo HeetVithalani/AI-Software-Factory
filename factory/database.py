@@ -19,7 +19,7 @@ from factory.config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
@@ -352,6 +352,44 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    """
+    Add project-scoped skill enablement bindings (Phase 2c).
+
+    A binding records that a human explicitly enabled one INSTALLED,
+    clean, approval-bound, hash-verified skill revision as untrusted
+    reference context for one resolved project workspace. The unique
+    (project_key, tool_id) constraint guarantees exactly one enabled
+    revision per tool per project; re-enabling updates the pinned
+    revision. Bindings never grant capabilities and are never read by
+    any tool — only by the skill-context provider at request time.
+    """
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS skill_bindings (
+            binding_id   TEXT PRIMARY KEY,
+            project_key  TEXT NOT NULL,
+            tool_id      TEXT NOT NULL
+                REFERENCES tool_registry(tool_id) ON DELETE CASCADE,
+            revision_sha TEXT NOT NULL,
+            note         TEXT NOT NULL,
+            actor        TEXT NOT NULL,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            UNIQUE (project_key, tool_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_bindings_project "
+        "ON skill_bindings(project_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_bindings_tool "
+        "ON skill_bindings(tool_id)"
+    )
+
+
 def initialize_database(db_path: Path | None = None) -> None:
     """
     Create or migrate the factory database to the current schema version.
@@ -392,6 +430,13 @@ def initialize_database(db_path: Path | None = None) -> None:
             _migrate_v4(conn)
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (4,)
+            )
+
+        if current < 5:
+            logger.info("Applying schema migration v5 (skill_bindings)…")
+            _migrate_v5(conn)
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (5,)
             )
 
         conn.commit()

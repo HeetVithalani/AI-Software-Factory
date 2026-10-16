@@ -229,6 +229,7 @@ class PlannerAgent(BaseAgent):
                 system_prompt=system_prompt,
                 messages=messages,
                 response_schema=PlannerProposal,
+                agent_id=self.agent_type,
             )
             response = self._llm.complete(request)
         except Exception as exc:

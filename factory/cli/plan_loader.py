@@ -47,6 +47,25 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Built-in agent types (Phase 2c)
+# ---------------------------------------------------------------------------
+
+# The complete set of registered built-in agent executors. Plans may
+# only reference these types; nothing — least of all skill reference
+# content, which is inert prompt text — can register a new executor or
+# make the loader accept a foreign agent class.
+BUILTIN_AGENT_TYPES: tuple[str, ...] = (
+    "planner",
+    "builder",
+    "reviewer",
+    "qa",
+    "security",
+    "documentation",
+    "auditor",
+)
+
+
+# ---------------------------------------------------------------------------
 # DAG loader
 # ---------------------------------------------------------------------------
 
@@ -101,6 +120,17 @@ def load_dag_from_plan(plan_path: Path) -> tuple[TaskDAG, dict[str, Any]]:
             )
         name = str(raw.get("name", task_id))
         agent_type = str(raw.get("agent_type", "")).strip()
+        # Fail-closed (Phase 2c): any non-empty agent_type must be one of
+        # the registered built-in agent types. Empty stays allowed for
+        # backward compatibility (dispatch reports the missing executor
+        # as before), but a *foreign* type is rejected at load time so it
+        # can never reach agent construction or execution.
+        if agent_type and agent_type not in BUILTIN_AGENT_TYPES:
+            raise ConfigurationError(
+                f"plan.json: task {task_id!r} has unknown agent_type "
+                f"{agent_type!r}; only the registered built-in agent "
+                f"types are allowed: {', '.join(BUILTIN_AGENT_TYPES)}"
+            )
         depends_on = [str(d) for d in raw.get("depends_on", [])]
         metadata: dict[str, Any] = dict(raw.get("metadata", {}))
         # Carry description into metadata so agents can find it

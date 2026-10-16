@@ -79,6 +79,7 @@ class BuilderAgent(BaseAgent):
                 messages=messages,
                 output_schema=BuilderProposal.model_json_schema(),
                 project_id=task.project_id,
+                agent_id=self.agent_type,
             )
             
             # 2. Execute LLM Call with Retries
@@ -138,6 +139,7 @@ class BuilderAgent(BaseAgent):
                         system_prompt=system_prompt,
                         messages=messages,
                         output_schema=BuilderProposal.model_json_schema(),
+                        agent_id=self.agent_type,
                     )
 
                 attempt += 1

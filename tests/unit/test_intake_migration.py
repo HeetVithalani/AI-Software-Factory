@@ -19,6 +19,7 @@ from factory.database import (
     _migrate_v1,
     _migrate_v2,
     _migrate_v3,
+    _migrate_v4,
     get_connection,
     initialize_database,
     to_json,
@@ -52,17 +53,36 @@ def _make_v3_db(db_path: Path) -> None:
     conn.close()
 
 
+def _make_v4_db(db_path: Path) -> None:
+    """Simulate a database that has been fully migrated to schema v4."""
+    conn = get_connection(db_path)
+    _create_schema_version_table(conn)
+    conn.commit()
+    _migrate_v1(conn)
+    conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+    _migrate_v2(conn)
+    conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+    _migrate_v3(conn)
+    conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+    _migrate_v4(conn)
+    conn.execute("INSERT INTO schema_version (version) VALUES (4)")
+    conn.commit()
+    conn.close()
+
+
 class TestFreshDatabase:
-    def test_fresh_db_reaches_v4(self, tmp_path: Path) -> None:
+    def test_fresh_db_reaches_v5(self, tmp_path: Path) -> None:
         db = tmp_path / "factory.db"
         initialize_database(db)
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4]
+            assert _versions(conn) == [1, 2, 3, 4, 5]
             tables = _tables(conn)
-            assert {"tool_registry", "tool_revisions"} <= tables
+            assert {
+                "tool_registry", "tool_revisions", "skill_bindings",
+            } <= tables
 
     def test_current_version_constant(self) -> None:
-        assert CURRENT_SCHEMA_VERSION == 4
+        assert CURRENT_SCHEMA_VERSION == 5
 
     def test_v4_tables_have_expected_columns(self, tmp_path: Path) -> None:
         db = tmp_path / "factory.db"
@@ -136,7 +156,60 @@ class TestFreshDatabase:
                 "idx_tool_registry_status",
                 "idx_tool_revisions_tool",
                 "idx_tool_revisions_sha",
+                "idx_skill_bindings_project",
+                "idx_skill_bindings_tool",
             } <= names
+
+    def test_v5_skill_bindings_columns(self, tmp_path: Path) -> None:
+        db = tmp_path / "factory.db"
+        initialize_database(db)
+        with get_connection(db) as conn:
+            cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(skill_bindings)"
+            ).fetchall()}
+            assert {
+                "binding_id", "project_key", "tool_id", "revision_sha",
+                "note", "actor", "enabled", "created_at", "updated_at",
+            } <= cols
+
+    def test_v5_unique_project_tool_constraint(self, tmp_path: Path) -> None:
+        db = tmp_path / "factory.db"
+        initialize_database(db)
+        with get_connection(db) as conn:
+            conn.execute(
+                """INSERT INTO tool_registry
+                   (tool_id, kind, name, source_url, created_at, updated_at)
+                   VALUES ('t1', 'agent_skill', 'n', 'u', 'now', 'now')"""
+            )
+            conn.execute(
+                """INSERT INTO skill_bindings
+                   (binding_id, project_key, tool_id, revision_sha, note,
+                    actor, enabled, created_at, updated_at)
+                   VALUES ('b1', 'proj', 't1', 'sha', 'n', 'a', 1, 't', 't')"""
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO skill_bindings
+                       (binding_id, project_key, tool_id, revision_sha, note,
+                        actor, enabled, created_at, updated_at)
+                       VALUES ('b2', 'proj', 't1', 'sha2', 'n', 'a', 1,
+                               't', 't')"""
+                )
+            conn.rollback()
+
+    def test_v5_binding_foreign_key_enforced(self, tmp_path: Path) -> None:
+        db = tmp_path / "factory.db"
+        initialize_database(db)
+        with get_connection(db) as conn:
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO skill_bindings
+                       (binding_id, project_key, tool_id, revision_sha, note,
+                        actor, enabled, created_at, updated_at)
+                       VALUES ('b1', 'proj', 'ghost', 'sha', 'n', 'a', 1,
+                               't', 't')"""
+                )
+            conn.rollback()
 
 
 class TestV3ToV4Upgrade:
@@ -161,7 +234,7 @@ class TestV3ToV4Upgrade:
         initialize_database(db)
 
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4]
+            assert _versions(conn) == [1, 2, 3, 4, 5]
             assert {"tool_registry", "tool_revisions"} <= _tables(conn)
             project = conn.execute(
                 "SELECT name FROM projects WHERE project_id='p1'"
@@ -177,8 +250,65 @@ class TestV3ToV4Upgrade:
         initialize_database(db)
         initialize_database(db)  # second run must be a no-op
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4]
-            assert _tables(conn).issuperset({"tool_registry", "tool_revisions"})
+            assert _versions(conn) == [1, 2, 3, 4, 5]
+            assert _tables(conn).issuperset(
+                {"tool_registry", "tool_revisions", "skill_bindings"}
+            )
+
+
+class TestV4ToV5Upgrade:
+    def test_upgrade_preserves_v4_data(self, tmp_path: Path) -> None:
+        db = tmp_path / "factory.db"
+        _make_v4_db(db)
+
+        # Seed pre-existing v4 rows.
+        with get_connection(db) as conn:
+            conn.execute(
+                """INSERT INTO tool_registry
+                   (tool_id, kind, name, source_url, status, created_at,
+                    updated_at)
+                   VALUES ('t_keep', 'agent_skill', 'keepme', 'u',
+                           'installed', 't', 't')"""
+            )
+            conn.execute(
+                """INSERT INTO tool_revisions
+                   (revision_id, tool_id, revision_sha, scan_state,
+                    created_at, updated_at)
+                   VALUES ('r_keep', 't_keep', 'sha1', 'clean', 't', 't')"""
+            )
+            conn.execute(
+                """INSERT INTO events (event_type, timestamp, payload)
+                   VALUES ('old.v4.event', 't', ?)""",
+                (to_json({"kept": True}),),
+            )
+            conn.commit()
+
+        initialize_database(db)
+
+        with get_connection(db) as conn:
+            assert _versions(conn) == [1, 2, 3, 4, 5]
+            assert "skill_bindings" in _tables(conn)
+            tool = conn.execute(
+                "SELECT name FROM tool_registry WHERE tool_id='t_keep'"
+            ).fetchone()
+            assert tool is not None and tool["name"] == "keepme"
+            rev = conn.execute(
+                "SELECT scan_state FROM tool_revisions "
+                "WHERE revision_id='r_keep'"
+            ).fetchone()
+            assert rev is not None and rev["scan_state"] == "clean"
+            event = conn.execute(
+                "SELECT payload FROM events WHERE event_type='old.v4.event'"
+            ).fetchone()
+            assert event is not None and "kept" in event["payload"]
+
+    def test_v4_to_v5_migration_idempotent(self, tmp_path: Path) -> None:
+        db = tmp_path / "factory.db"
+        _make_v4_db(db)
+        initialize_database(db)
+        initialize_database(db)  # second run must be a no-op
+        with get_connection(db) as conn:
+            assert _versions(conn) == [1, 2, 3, 4, 5]
 
 
 class TestNonNegotiablePolicy:

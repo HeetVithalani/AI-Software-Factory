@@ -164,3 +164,82 @@ class TestFindPlanPath:
         result = find_plan_path(tmp_path)
         # Should return some path (may not exist — caller handles that)
         assert isinstance(result, Path)
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed agent_type validation (Phase 2c)
+# ---------------------------------------------------------------------------
+
+class TestAgentTypeValidation:
+    def test_all_builtin_agent_types_pass(self, tmp_path):
+        from factory.cli.plan_loader import BUILTIN_AGENT_TYPES
+        plan = {
+            "project_id": "p",
+            "tasks": [
+                {
+                    "task_id": f"t-{agent_type}",
+                    "name": agent_type.title(),
+                    "agent_type": agent_type,
+                    "depends_on": [],
+                    "description": "step",
+                }
+                for agent_type in BUILTIN_AGENT_TYPES
+            ],
+        }
+        dag, _ = load_dag_from_plan(_write_plan(tmp_path, plan))
+        assert dag.node_count() == len(BUILTIN_AGENT_TYPES)
+
+    def test_unknown_agent_type_rejected_before_execution(self, tmp_path):
+        plan = {
+            "tasks": [
+                {
+                    "task_id": "t1", "name": "T1",
+                    "agent_type": "hacker-agent",
+                    "depends_on": [], "description": "x",
+                }
+            ]
+        }
+        with pytest.raises(ConfigurationError, match="unknown agent_type"):
+            load_dag_from_plan(_write_plan(tmp_path, plan))
+
+    def test_agent_type_from_skill_content_rejected(self, tmp_path):
+        # Nothing outside the built-in set — e.g. content a skill asked
+        # to register — can pass load-time validation.
+        plan = {
+            "tasks": [
+                {
+                    "task_id": "t1", "name": "T1",
+                    "agent_type": "skill-defined-executor",
+                    "depends_on": [], "description": "x",
+                }
+            ]
+        }
+        with pytest.raises(ConfigurationError, match="unknown agent_type"):
+            load_dag_from_plan(_write_plan(tmp_path, plan))
+
+    def test_agent_type_is_case_sensitive(self, tmp_path):
+        plan = {
+            "tasks": [
+                {
+                    "task_id": "t1", "name": "T1",
+                    "agent_type": "Builder",
+                    "depends_on": [], "description": "x",
+                }
+            ]
+        }
+        with pytest.raises(ConfigurationError, match="unknown agent_type"):
+            load_dag_from_plan(_write_plan(tmp_path, plan))
+
+    def test_empty_agent_type_still_loads(self, tmp_path):
+        # Backward compatibility: an empty agent_type loads as before and
+        # fails later at dispatch (existing behavior, not this guard).
+        plan = {
+            "tasks": [
+                {
+                    "task_id": "t1", "name": "T1",
+                    "depends_on": [], "description": "x",
+                }
+            ]
+        }
+        dag, _ = load_dag_from_plan(_write_plan(tmp_path, plan))
+        assert dag.get("t1").agent_type == ""

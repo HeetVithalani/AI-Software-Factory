@@ -67,7 +67,17 @@ def run_project(project_path: str, task_desc: str, plan_arg: str | None) -> int:
     audit_logger = AuditLogger()
     broker = PermissionBroker(policies=load_policies())
     llm_router = LLMRouter()
-    context_builder = ContextBuilder(state=state)
+    # Phase 2c: one explicit per-run integration point for project-scoped
+    # skill context. The provider's project_key is derived from the SAME
+    # resolved workspace path the enable/disable CLI uses, so enablement
+    # and runtime retrieval can never disagree about project identity.
+    from factory.skills.bindings import project_key_for
+    from factory.skills.provider import SkillContextProvider
+    skill_provider = SkillContextProvider(
+        project_key=project_key_for(path),
+        audit_logger=audit_logger,
+    )
+    context_builder = ContextBuilder(state=state, skill_provider=skill_provider)
     settings = get_settings()
 
     # ------------------------------------------------------------------

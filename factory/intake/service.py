@@ -926,8 +926,10 @@ class IntakeService:
     def install(self, tool_id: str, revision_sha: str) -> IntakeSummary:
         """
         Copy approved quarantined content into the isolated per-tool
-        install directory. Content is never executed, and installed skills
-        are never enabled or loaded into any agent (Phase 2a has no loader).
+        install directory. Content is never executed; installation alone
+        never loads a skill into any agent — runtime use requires an
+        explicit per-project 'enable' binding (Phase 2c), which itself
+        re-verifies this installation's integrity.
 
         Fail-closed pre-write check: the install root must be git-ignored
         (verified via the injectable checker) before any bytes are written.

@@ -159,6 +159,14 @@ class IntakeSettings:
     fetch_timeout_seconds: int = 60
     scan_timeout_seconds: int = 300
     skillspector_executable: str = "skillspector"
+    # Skill-context runtime caps (Phase 2c). These bound what the
+    # skill-context provider may inject into an LLM request; they are
+    # hard limits, not preferences.
+    skill_max_injected: int = 3            # max skills injected per request
+    skill_min_relevance: float = 0.2       # documented relevance threshold
+    skill_per_skill_max_chars: int = 4000  # per-skill injected body cap
+    skill_aggregate_max_chars: int = 12000 # total injected skill chars cap
+    skill_file_max_bytes: int = 65536      # SKILL.md read bound
 
 
 @dataclass
@@ -269,6 +277,16 @@ def _apply_factory_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
         its.scan_timeout_seconds = int(it["scan_timeout_seconds"])
     if "skillspector_executable" in it:
         its.skillspector_executable = str(it["skillspector_executable"])
+    if "skill_max_injected" in it:
+        its.skill_max_injected = int(it["skill_max_injected"])
+    if "skill_min_relevance" in it:
+        its.skill_min_relevance = float(it["skill_min_relevance"])
+    if "skill_per_skill_max_chars" in it:
+        its.skill_per_skill_max_chars = int(it["skill_per_skill_max_chars"])
+    if "skill_aggregate_max_chars" in it:
+        its.skill_aggregate_max_chars = int(it["skill_aggregate_max_chars"])
+    if "skill_file_max_bytes" in it:
+        its.skill_file_max_bytes = int(it["skill_file_max_bytes"])
 
 
 def _apply_models_yaml(settings: FullSettings, data: dict[str, Any]) -> None:

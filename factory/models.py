@@ -315,8 +315,10 @@ class IntakeStatus(str, Enum):
   DISCOVERY_FAILED   (fetch       SCAN_FAILED
                       errors)         │
     Failure/governance states: REJECTED (policy), STALE (content drift),
-    REVOKED (human disable). Installed skills remain disabled/unloaded:
-    Phase 2a has no mechanism that loads installed skills into any agent.
+    REVOKED (human disable). Installed skill content enters agents only
+    as explicitly project-enabled, untrusted reference context (Phase 2c
+    skill-context provider) — never executed, and never loaded without a
+    per-project human enablement binding.
     """
     DISCOVERED = "discovered"
     DISCOVERY_FAILED = "discovery_failed"
@@ -411,3 +413,31 @@ class ToolRevision(BaseModel):
             and self.approval_artifact_sha256
             and self.approval_report_sha256
         )
+
+
+class SkillBinding(BaseModel):
+    """
+    Per-project runtime enablement of ONE installed skill revision
+    (Phase 2c). A binding never installs, revives, or executes anything:
+    it only records that a human explicitly enabled an already-installed,
+    clean, hash-verified revision as untrusted reference context for one
+    resolved project workspace (``project_key``).
+
+    The binding is scoped to the project only — disabling it never
+    affects the global tool installation.
+    """
+    model_config = {"use_enum_values": True}
+
+    binding_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    project_key: str
+    tool_id: str
+    revision_sha: str
+    note: str
+    actor: str
+    enabled: bool = True
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
