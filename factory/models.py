@@ -184,6 +184,10 @@ class ApprovalRequest(BaseModel):
     # Scope boundary — used to match future inheritance
     action_category: str = ""     # e.g. "git.commit", "shell.run"
     scope_key: str = ""           # deterministic key for scope matching
+    # Exact-operation binding (SEC-006): sha256 of
+    # category::target::action. Empty only for legacy rows written before
+    # schema v6 — such rows are never sufficient for inheritance.
+    operation_fingerprint: str = ""
 
     requested_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

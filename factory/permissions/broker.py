@@ -259,10 +259,21 @@ class PermissionBroker:
 
         # ---- 5. Check scope inheritance ----
         if self._policies.auto_approve_inherited:
+            # Exact-operation binding (SEC-006): the requested operation
+            # must hash identically to what was approved — same category,
+            # same target, same exact action string.
+            from factory.permissions.approvals import (
+                make_operation_fingerprint,
+            )
+            effective_category = action_category or ctx.category
+            operation_fingerprint = make_operation_fingerprint(
+                effective_category, target, action
+            )
             inherited = self.approval_manager.find_inherited(
-                action_category=action_category or ctx.category,
+                action_category=effective_category,
                 target=target,
                 risk_level=risk_level,
+                operation_fingerprint=operation_fingerprint,
             )
             if inherited is not None:
                 meta["inherited_from"] = inherited.request_id

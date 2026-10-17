@@ -19,7 +19,7 @@ from factory.config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
@@ -390,6 +390,34 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v6(conn: sqlite3.Connection) -> None:
+    """
+    Bind approvals to the exact operation they authorized (SEC-006).
+
+    ``operation_fingerprint`` is a sha256 digest over
+    ``action_category::target::action`` — every material action
+    parameter. Inheritance lookups require an exact fingerprint match,
+    so a materially altered command, argument, path, or payload can no
+    longer ride on a similar prior approval.
+
+    Legacy rows written before this migration receive NULL and are
+    treated as unbound: they are never sufficient to authorize a new
+    operation (fresh approval required). This is deliberately
+    fail-closed — there is no wildcard fallback.
+    """
+    try:
+        conn.execute(
+            "ALTER TABLE approvals ADD COLUMN operation_fingerprint TEXT"
+        )
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_approvals_fingerprint "
+        "ON approvals(operation_fingerprint)"
+    )
+
+
 def initialize_database(db_path: Path | None = None) -> None:
     """
     Create or migrate the factory database to the current schema version.
@@ -437,6 +465,15 @@ def initialize_database(db_path: Path | None = None) -> None:
             _migrate_v5(conn)
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (5,)
+            )
+
+        if current < 6:
+            logger.info(
+                "Applying schema migration v6 (approvals.operation_fingerprint)…"
+            )
+            _migrate_v6(conn)
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (6,)
             )
 
         conn.commit()

@@ -71,6 +71,27 @@ def _make_scope_key(action_category: str, target: str) -> str:
     return hashlib.sha1(raw.encode(), usedforsecurity=False).hexdigest()[:16]
 
 
+def make_operation_fingerprint(
+    action_category: str, target: str, action: str
+) -> str:
+    """
+    Produce the exact-operation binding for an approval (SEC-006).
+
+    The fingerprint covers every material action parameter: the action
+    category, the target, and the exact action string (program,
+    arguments, path, payload — verbatim, case-sensitive). A materially
+    altered operation hashes differently and therefore cannot inherit a
+    prior approval; only an unchanged operation does.
+
+    Risk classification is intentionally NOT part of the digest — it is
+    enforced separately as the approved risk ceiling, so an identical
+    operation re-classified at a *lower* risk still inherits while a
+    higher-risk re-run is rejected.
+    """
+    raw = f"{(action_category or '').lower()}::{(target or '').lower()}::{action or ''}"
+    return hashlib.sha256(raw.encode(), usedforsecurity=False).hexdigest()[:32]
+
+
 # ---------------------------------------------------------------------------
 # In-memory inheritance index entry
 # ---------------------------------------------------------------------------
@@ -84,6 +105,7 @@ class _ScopeEntry:
         "scope_key",
         "approved_risk_index",
         "grants_scope_inheritance",
+        "operation_fingerprint",
     )
 
     def __init__(
@@ -94,14 +116,22 @@ class _ScopeEntry:
         scope_key: str,
         approved_risk_index: int,
         grants_scope_inheritance: bool,
+        operation_fingerprint: str = "",
     ) -> None:
         self.request_id = request_id
         self.action_category = action_category
         self.scope_key = scope_key
         self.approved_risk_index = approved_risk_index
         self.grants_scope_inheritance = grants_scope_inheritance
+        self.operation_fingerprint = operation_fingerprint
 
-    def covers(self, action_category: str, scope_key: str, risk_index: int) -> bool:
+    def covers(
+        self,
+        action_category: str,
+        scope_key: str,
+        risk_index: int,
+        operation_fingerprint: str,
+    ) -> bool:
         """
         Return True if this scope entry covers the given action.
 
@@ -110,12 +140,18 @@ class _ScopeEntry:
         2. The scope_key matches (same deterministic hash → same target+category).
         3. The requested risk index does not exceed the approved ceiling.
         4. This approval grants scope inheritance.
+        5. The operation fingerprint matches EXACTLY — the approved
+           operation is unchanged. Entries without a stored fingerprint
+           (legacy, pre-v6 rows) never cover anything: empty never
+           equals an incoming fingerprint (fail-closed, no wildcard).
         """
         return (
             self.grants_scope_inheritance
             and self.action_category == action_category
             and self.scope_key == scope_key
             and risk_index <= self.approved_risk_index
+            and bool(operation_fingerprint)
+            and self.operation_fingerprint == operation_fingerprint
         )
 
 
@@ -142,11 +178,16 @@ class ApprovalManager:
             action_category="git.commit",
         )
 
-        # Check for an existing inherited approval first
+        # Check for an existing inherited approval first — the exact
+        # operation must be unchanged (operation_fingerprint binding)
         inherited = mgr.find_inherited(
             action_category="git.commit",
             target="repo:main",
             risk_level=RiskLevel.HIGH,
+            operation_fingerprint=make_operation_fingerprint(
+                "git.commit", "repo:main",
+                "git commit -m 'add feature'",
+            ),
         )
         if inherited:
             # No fresh approval needed
@@ -208,6 +249,9 @@ class ApprovalManager:
         responsible for checking the status before proceeding.
         """
         scope_key = _make_scope_key(action_category or action, target)
+        operation_fingerprint = make_operation_fingerprint(
+            action_category or action, target, action
+        )
 
         req = ApprovalRequest(
             project_id=project_id or self._project_id,
@@ -221,6 +265,7 @@ class ApprovalManager:
             consequence_if_denied=consequence_if_denied,
             action_category=action_category,
             scope_key=scope_key,
+            operation_fingerprint=operation_fingerprint,
             status=ApprovalStatus.PENDING,
         )
 
@@ -231,6 +276,7 @@ class ApprovalManager:
             "risk_level": risk_level.value if isinstance(risk_level, RiskLevel) else str(risk_level),
             "action_category": action_category,
             "scope_key": scope_key,
+            "operation_fingerprint": operation_fingerprint,
         })
         logger.info(
             "Approval requested: %s | category=%s | risk=%s | id=%s",
@@ -264,6 +310,7 @@ class ApprovalManager:
                         scope_key=decision.scope_key,
                         approved_risk_index=_risk_index(req.risk_level),
                         grants_scope_inheritance=True,
+                        operation_fingerprint=req.operation_fingerprint,
                     )
                     with self._lock:
                         self._scope_index.setdefault(decision.scope_key, []).append(entry)
@@ -288,6 +335,7 @@ class ApprovalManager:
         action_category: str,
         target: str,
         risk_level: RiskLevel,
+        operation_fingerprint: str,
     ) -> ApprovalRequest | None:
         """
         Return the first active inherited approval that covers this action,
@@ -296,12 +344,26 @@ class ApprovalManager:
         An inherited approval is valid when:
         - The previously approved action_category matches exactly.
         - The scope_key (derived from category + target) matches.
+        - The operation fingerprint matches EXACTLY — the requested
+          operation is byte-for-byte the operation that was approved
+          (see :func:`make_operation_fingerprint`).
         - The risk level does not exceed the approved ceiling.
         - The original decision had ``grants_scope_inheritance=True``.
 
-        Materially different actions (different category or target) or
-        higher-risk actions always return ``None`` — fresh approval required.
+        Materially different actions (different category, target, or any
+        changed command/argument/path/payload), higher-risk actions, and
+        legacy approvals without a stored fingerprint always return
+        ``None`` — fresh approval required. An empty incoming
+        fingerprint also returns ``None`` (fail-closed).
         """
+        if not operation_fingerprint:
+            logger.debug(
+                "find_inherited: empty operation fingerprint — refusing "
+                "inheritance (category=%s, target=%s).",
+                action_category, target,
+            )
+            return None
+
         self._ensure_index()
         scope_key = _make_scope_key(action_category, target)
         risk_idx = _risk_index(risk_level)
@@ -309,7 +371,9 @@ class ApprovalManager:
         with self._lock:
             entries = self._scope_index.get(scope_key, [])
             for entry in entries:
-                if entry.covers(action_category, scope_key, risk_idx):
+                if entry.covers(
+                    action_category, scope_key, risk_idx, operation_fingerprint
+                ):
                     req = self.get_request(entry.request_id)
                     if req is not None:
                         self._audit("approval.inherited", entry.request_id, {
@@ -317,12 +381,68 @@ class ApprovalManager:
                             "target": target,
                             "risk_level": str(risk_level),
                             "scope_key": scope_key,
+                            "operation_fingerprint": operation_fingerprint,
                         })
                         logger.debug(
                             "Approval inherited from request_id=%s for category=%s",
                             entry.request_id, action_category,
                         )
                         return req
+
+        # DB fallback: grants recorded by ANOTHER process (e.g. the
+        # approvals CLI while the orchestrator holds a stale index) must
+        # still be honoured — with exact scope + fingerprint equality so
+        # nothing beyond the exact approved operation is admitted.
+        from factory.database import get_connection
+        try:
+            with get_connection(self._db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT request_id, action_category, scope_key,
+                           risk_level, grants_scope_inheritance,
+                           operation_fingerprint
+                      FROM approvals
+                     WHERE status = 'approved'
+                       AND grants_scope_inheritance = 1
+                       AND scope_key = ?
+                       AND operation_fingerprint = ?
+                    """,
+                    (scope_key, operation_fingerprint),
+                ).fetchall()
+        except Exception as exc:  # DB might not exist yet in tests
+            logger.debug("find_inherited: DB fallback unavailable: %s", exc)
+            rows = []
+
+        for row in rows:
+            r = dict(row)
+            entry = _ScopeEntry(
+                request_id=r["request_id"],
+                action_category=r["action_category"] or "",
+                scope_key=r["scope_key"] or "",
+                approved_risk_index=_risk_index(r["risk_level"]),
+                grants_scope_inheritance=bool(r["grants_scope_inheritance"]),
+                operation_fingerprint=r.get("operation_fingerprint") or "",
+            )
+            if entry.covers(
+                action_category, scope_key, risk_idx, operation_fingerprint
+            ):
+                with self._lock:
+                    self._scope_index.setdefault(scope_key, []).append(entry)
+                req = self.get_request(entry.request_id)
+                if req is not None:
+                    self._audit("approval.inherited", entry.request_id, {
+                        "action_category": action_category,
+                        "target": target,
+                        "risk_level": str(risk_level),
+                        "scope_key": scope_key,
+                        "operation_fingerprint": operation_fingerprint,
+                        "source": "db",
+                    })
+                    logger.debug(
+                        "Approval inherited (db) from request_id=%s",
+                        entry.request_id,
+                    )
+                    return req
         return None
 
     def get_request(self, request_id: str) -> ApprovalRequest | None:
@@ -355,6 +475,7 @@ class ApprovalManager:
         action_category: str,
         target: str,
         risk_level: RiskLevel,
+        operation_fingerprint: str,
     ) -> bool:
         """
         Convenience method: return True if a valid inherited approval exists.
@@ -365,6 +486,7 @@ class ApprovalManager:
             action_category=action_category,
             target=target,
             risk_level=risk_level,
+            operation_fingerprint=operation_fingerprint,
         ) is not None
 
     # ------------------------------------------------------------------
@@ -385,7 +507,7 @@ class ApprovalManager:
                     request_id, project_id, task_id, agent_id,
                     action, target, reason, expected_effect,
                     risk_level, consequence_if_denied,
-                    action_category, scope_key,
+                    action_category, scope_key, operation_fingerprint,
                     requested_at, status,
                     decided_at, decided_by, decision_note,
                     grants_scope_inheritance
@@ -393,7 +515,7 @@ class ApprovalManager:
                     ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?,
-                    ?, ?,
+                    ?, ?, ?,
                     ?, ?,
                     ?, ?, ?,
                     ?
@@ -412,6 +534,7 @@ class ApprovalManager:
                     req.consequence_if_denied,
                     req.action_category,
                     req.scope_key,
+                    req.operation_fingerprint,
                     req.requested_at.isoformat(),
                     st_val,
                     req.decided_at.isoformat() if req.decided_at else None,
@@ -475,7 +598,8 @@ class ApprovalManager:
                 rows = conn.execute(
                     """
                     SELECT request_id, action_category, scope_key,
-                           risk_level, grants_scope_inheritance
+                           risk_level, grants_scope_inheritance,
+                           operation_fingerprint
                       FROM approvals
                      WHERE status = 'approved'
                        AND grants_scope_inheritance = 1
@@ -493,6 +617,8 @@ class ApprovalManager:
                 scope_key=r["scope_key"] or "",
                 approved_risk_index=_risk_index(r["risk_level"]),
                 grants_scope_inheritance=bool(r["grants_scope_inheritance"]),
+                # NULL for legacy pre-v6 rows → "" → never covers (fail-closed)
+                operation_fingerprint=r.get("operation_fingerprint") or "",
             )
             if entry.scope_key:
                 self._scope_index.setdefault(entry.scope_key, []).append(entry)
@@ -555,6 +681,7 @@ class ApprovalManager:
             consequence_if_denied=row.get("consequence_if_denied", ""),
             action_category=row.get("action_category", ""),
             scope_key=row.get("scope_key", ""),
+            operation_fingerprint=row.get("operation_fingerprint") or "",
             requested_at=requested_at,
             status=ApprovalStatus(row.get("status", "pending")),
             decided_at=_parse_dt(row.get("decided_at")),

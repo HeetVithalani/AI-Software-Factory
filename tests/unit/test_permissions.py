@@ -24,7 +24,12 @@ from factory.models import (
     ApprovalStatus,
     RiskLevel,
 )
-from factory.permissions.approvals import ApprovalManager, _make_scope_key, _risk_index
+from factory.permissions.approvals import (
+    ApprovalManager,
+    _make_scope_key,
+    _risk_index,
+    make_operation_fingerprint,
+)
 from factory.permissions.broker import (
     PermissionBroker,
     PermissionDecision,
@@ -59,6 +64,7 @@ def _make_db() -> Path:
             consequence_if_denied TEXT NOT NULL DEFAULT '',
             action_category       TEXT NOT NULL DEFAULT '',
             scope_key             TEXT NOT NULL DEFAULT '',
+            operation_fingerprint TEXT,
             requested_at          TEXT NOT NULL,
             status                TEXT NOT NULL DEFAULT 'pending',
             decided_at            TEXT,
@@ -103,6 +109,7 @@ def db(tmp_path: Path) -> Path:
             consequence_if_denied TEXT NOT NULL DEFAULT '',
             action_category       TEXT NOT NULL DEFAULT '',
             scope_key             TEXT NOT NULL DEFAULT '',
+            operation_fingerprint TEXT,
             requested_at          TEXT NOT NULL,
             status                TEXT NOT NULL DEFAULT 'pending',
             decided_at            TEXT,
@@ -353,49 +360,54 @@ class TestScopeMatching:
         return req
 
     def test_inherited_approval_same_category_and_target(self, mgr: ApprovalManager):
-        self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
+        req = self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
         inherited = mgr.find_inherited(
             action_category="git.commit",
             target="repo:main",
             risk_level=RiskLevel.HIGH,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert inherited is not None
 
     def test_no_inheritance_different_category(self, mgr: ApprovalManager):
-        self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
+        req = self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
         inherited = mgr.find_inherited(
             action_category="git.push",
             target="repo:main",
             risk_level=RiskLevel.HIGH,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert inherited is None
 
     def test_no_inheritance_different_target(self, mgr: ApprovalManager):
-        self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
+        req = self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
         inherited = mgr.find_inherited(
             action_category="git.commit",
             target="repo:develop",
             risk_level=RiskLevel.HIGH,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert inherited is None
 
     def test_risk_ceiling_respected_lower_is_ok(self, mgr: ApprovalManager):
         """An action with MEDIUM risk may inherit an approval granted for HIGH."""
-        self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
+        req = self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
         inherited = mgr.find_inherited(
             action_category="git.commit",
             target="repo:main",
             risk_level=RiskLevel.MEDIUM,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert inherited is not None
 
     def test_risk_ceiling_exceeded_critical_rejected(self, mgr: ApprovalManager):
         """A CRITICAL action cannot inherit an approval granted for HIGH."""
-        self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
+        req = self._approve_with_inheritance(mgr, "git.commit", "repo:main", RiskLevel.HIGH)
         inherited = mgr.find_inherited(
             action_category="git.commit",
             target="repo:main",
             risk_level=RiskLevel.CRITICAL,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert inherited is None
 
@@ -420,20 +432,23 @@ class TestScopeMatching:
             action_category="git.commit",
             target="repo:main",
             risk_level=RiskLevel.HIGH,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert inherited is None
 
     def test_is_approved_convenience(self, mgr: ApprovalManager):
-        self._approve_with_inheritance(mgr, "shell", "localhost", RiskLevel.MEDIUM)
+        req = self._approve_with_inheritance(mgr, "shell", "localhost", RiskLevel.MEDIUM)
         assert mgr.is_approved(
             action_category="shell",
             target="localhost",
             risk_level=RiskLevel.LOW,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert not mgr.is_approved(
             action_category="shell",
             target="remote-host",
             risk_level=RiskLevel.LOW,
+            operation_fingerprint=req.operation_fingerprint,
         )
 
 
@@ -463,6 +478,7 @@ class TestRejectionAndInvalid:
             action_category="git.push",
             target="repo:main",
             risk_level=RiskLevel.CRITICAL,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert inherited is None
 
@@ -472,7 +488,7 @@ class TestRejectionAndInvalid:
 
     def test_pending_not_in_inheritance(self, mgr: ApprovalManager):
         """A request that is still PENDING must not be returned as inherited."""
-        mgr.request_approval(
+        req = mgr.request_approval(
             action="git commit -m 'pending'",
             target="repo:main",
             reason="test",
@@ -486,8 +502,168 @@ class TestRejectionAndInvalid:
             action_category="git.commit",
             target="repo:main",
             risk_level=RiskLevel.HIGH,
+            operation_fingerprint=req.operation_fingerprint,
         )
         assert inherited is None
+
+
+# ===========================================================================
+# Operation-bound approvals (SEC-006)
+# ===========================================================================
+
+class TestOperationBinding:
+    """An approval covers exactly the operation that was approved."""
+
+    def _approve(
+        self, mgr: ApprovalManager, action: str,
+        *, category: str = "shell", target: str = "workspace",
+        risk: RiskLevel = RiskLevel.MEDIUM,
+    ) -> ApprovalRequest:
+        req = mgr.request_approval(
+            action=action,
+            target=target,
+            reason="test",
+            expected_effect="effect",
+            risk_level=risk,
+            consequence_if_denied="blocked",
+            action_category=category,
+        )
+        mgr.record_decision(ApprovalDecision(
+            request_id=req.request_id,
+            status=ApprovalStatus.APPROVED,
+            grants_scope_inheritance=True,
+            scope_key=req.scope_key,
+        ))
+        return req
+
+    def test_fingerprint_deterministic_and_param_bound(self):
+        a = make_operation_fingerprint("shell", "workspace", "python -m pytest")
+        b = make_operation_fingerprint("shell", "workspace", "python -m pytest")
+        c = make_operation_fingerprint("shell", "workspace", "python -m pytest -x")
+        d = make_operation_fingerprint("shell", "other", "python -m pytest")
+        # Category/target are case-insensitive; the action is exact.
+        e = make_operation_fingerprint("Shell", "Workspace", "python -m pytest")
+        f = make_operation_fingerprint("shell", "workspace", "Python -m pytest")
+        assert a == b
+        assert a != c          # argument change → different fingerprint
+        assert a != d          # target change → different fingerprint
+        assert a == e          # category/target casing is immaterial
+        assert a != f          # action casing IS material (verbatim argv)
+        assert len(a) == 32
+
+    def test_unchanged_operation_inherits(self, mgr: ApprovalManager):
+        self._approve(mgr, "python -m pytest tests/unit")
+        fp = make_operation_fingerprint(
+            "shell", "workspace", "python -m pytest tests/unit"
+        )
+        assert mgr.find_inherited(
+            action_category="shell",
+            target="workspace",
+            risk_level=RiskLevel.MEDIUM,
+            operation_fingerprint=fp,
+        ) is not None
+
+    def test_changed_arguments_rejected(self, mgr: ApprovalManager):
+        self._approve(mgr, "python -m pytest tests/unit")
+        fp_changed = make_operation_fingerprint(
+            "shell", "workspace", "python -m pytest tests/unit --no-header -p no:cacheprovider"
+        )
+        assert mgr.find_inherited(
+            action_category="shell",
+            target="workspace",
+            risk_level=RiskLevel.MEDIUM,
+            operation_fingerprint=fp_changed,
+        ) is None
+
+    def test_changed_target_rejected(self, mgr: ApprovalManager):
+        self._approve(mgr, "python -m pytest tests/unit")
+        fp = make_operation_fingerprint(
+            "shell", "other-workspace", "python -m pytest tests/unit"
+        )
+        assert mgr.find_inherited(
+            action_category="shell",
+            target="other-workspace",
+            risk_level=RiskLevel.MEDIUM,
+            operation_fingerprint=fp,
+        ) is None
+
+    def test_empty_fingerprint_refused(self, mgr: ApprovalManager):
+        self._approve(mgr, "python -m pytest tests/unit")
+        assert mgr.find_inherited(
+            action_category="shell",
+            target="workspace",
+            risk_level=RiskLevel.MEDIUM,
+            operation_fingerprint="",
+        ) is None
+
+    def test_legacy_null_fingerprint_never_inherits(self, mgr: ApprovalManager, db: Path):
+        """Pre-v6 rows (NULL fingerprint) are insufficient: fresh approval."""
+        req = self._approve(mgr, "python -m pytest tests/unit")
+        # Simulate a legacy row written before schema v6
+        from factory.database import get_connection
+        with get_connection(db) as conn:
+            conn.execute(
+                "UPDATE approvals SET operation_fingerprint = NULL "
+                "WHERE request_id = ?",
+                (req.request_id,),
+            )
+            conn.commit()
+
+        # Fresh manager → index rebuilt from DB (NULL → "")
+        fresh = ApprovalManager(db_path=db)
+        fp = make_operation_fingerprint(
+            "shell", "workspace", "python -m pytest tests/unit"
+        )
+        assert fresh.find_inherited(
+            action_category="shell",
+            target="workspace",
+            risk_level=RiskLevel.MEDIUM,
+            operation_fingerprint=fp,
+        ) is None
+
+    def test_cross_process_grant_found_via_db(self, mgr: ApprovalManager, db: Path):
+        """A grant written by another process (approvals CLI) is honoured."""
+        # Create a pending request without recording an in-memory decision
+        pending = mgr.request_approval(
+            action="python -m pytest",
+            target="workspace",
+            reason="test",
+            expected_effect="effect",
+            risk_level=RiskLevel.MEDIUM,
+            consequence_if_denied="blocked",
+            action_category="shell",
+        )
+        # Write the approval decision exactly like the CLI does — direct SQL,
+        # bypassing record_decision() so the in-memory index never sees it.
+        from factory.database import get_connection
+        with get_connection(db) as conn:
+            conn.execute(
+                "UPDATE approvals SET status='approved', grants_scope_inheritance=1, "
+                "scope_key=?, decided_at=datetime('now'), decided_by='human' "
+                "WHERE request_id=?",
+                (pending.scope_key, pending.request_id),
+            )
+            conn.commit()
+
+        fp = make_operation_fingerprint("shell", "workspace", "python -m pytest")
+        inherited = mgr.find_inherited(
+            action_category="shell",
+            target="workspace",
+            risk_level=RiskLevel.MEDIUM,
+            operation_fingerprint=fp,
+        )
+        assert inherited is not None
+        assert inherited.request_id == pending.request_id
+        # And a DIFFERENT operation still does not inherit via that grant
+        fp_changed = make_operation_fingerprint(
+            "shell", "workspace", "python -m pytest --force"
+        )
+        assert mgr.find_inherited(
+            action_category="shell",
+            target="workspace",
+            risk_level=RiskLevel.MEDIUM,
+            operation_fingerprint=fp_changed,
+        ) is None
 
 
 # ===========================================================================
@@ -552,7 +728,7 @@ class TestBrokerDecision:
         assert "production" in decision.reason.lower()
 
     def test_inherited_approval_reused(self, broker: PermissionBroker):
-        """After one approval with inheritance, a second equivalent action is auto-approved."""
+        """After one approval with inheritance, an IDENTICAL operation is auto-approved."""
         ctx = ActionContext(category="git", command="git commit -m 'initial'")
         # First check → should require approval
         d1 = broker.check(
@@ -576,7 +752,48 @@ class TestBrokerDecision:
             scope_key=d1.approval_request.scope_key,
         ))
 
-        # Second equivalent action → should inherit
+        # Second IDENTICAL operation → should inherit (SEC-006: unchanged)
+        d2 = broker.check(
+            ctx,
+            action="git commit -m 'initial'",
+            target="repo:main",
+            reason="First commit",
+            expected_effect="Commit",
+            consequence_if_denied="Nothing committed",
+            action_category="git.commit",
+        )
+        assert d2.approved
+        assert d2.inherited_from == d1.approval_request.request_id
+
+    def test_changed_action_not_inherited(self, broker: PermissionBroker):
+        """SEC-006: a materially altered operation never inherits approval.
+
+        Approving ``git commit -m 'initial'`` must not authorise
+        ``git commit -m 'second'`` merely because category and target
+        are unchanged.
+        """
+        ctx = ActionContext(category="git", command="git commit -m 'initial'")
+        d1 = broker.check(
+            ctx,
+            action="git commit -m 'initial'",
+            target="repo:main",
+            reason="First commit",
+            expected_effect="Commit",
+            consequence_if_denied="Nothing committed",
+            action_category="git.commit",
+        )
+        assert d1.requires_approval
+        assert d1.approval_request is not None
+
+        from factory.models import ApprovalDecision as AD
+        broker.approval_manager.record_decision(AD(
+            request_id=d1.approval_request.request_id,
+            status=ApprovalStatus.APPROVED,
+            grants_scope_inheritance=True,
+            scope_key=d1.approval_request.scope_key,
+        ))
+
+        # Different commit message → different operation → fresh approval
         d2 = broker.check(
             ctx,
             action="git commit -m 'second'",
@@ -586,8 +803,11 @@ class TestBrokerDecision:
             consequence_if_denied="Nothing committed",
             action_category="git.commit",
         )
-        assert d2.approved
-        assert d2.inherited_from == d1.approval_request.request_id
+        assert d2.requires_approval
+        assert not d2.approved
+        assert d2.inherited_from is None
+        assert d2.approval_request is not None
+        assert d2.approval_request.request_id != d1.approval_request.request_id
 
     def test_higher_risk_not_inherited(self, broker: PermissionBroker):
         """

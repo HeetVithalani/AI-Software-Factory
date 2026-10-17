@@ -71,18 +71,32 @@ def _make_v4_db(db_path: Path) -> None:
 
 
 class TestFreshDatabase:
-    def test_fresh_db_reaches_v5(self, tmp_path: Path) -> None:
+    def test_fresh_db_reaches_v6(self, tmp_path: Path) -> None:
         db = tmp_path / "factory.db"
         initialize_database(db)
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
             tables = _tables(conn)
             assert {
                 "tool_registry", "tool_revisions", "skill_bindings",
             } <= tables
 
     def test_current_version_constant(self) -> None:
-        assert CURRENT_SCHEMA_VERSION == 5
+        assert CURRENT_SCHEMA_VERSION == 6
+
+    def test_v6_approval_fingerprint_column(self, tmp_path: Path) -> None:
+        """SEC-006: approvals carry the exact-operation fingerprint."""
+        db = tmp_path / "factory.db"
+        initialize_database(db)
+        with get_connection(db) as conn:
+            cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(approvals)"
+            ).fetchall()}
+            assert "operation_fingerprint" in cols
+            indexes = {r["name"] for r in conn.execute(
+                "PRAGMA index_list(approvals)"
+            ).fetchall()}
+            assert "idx_approvals_fingerprint" in indexes
 
     def test_v4_tables_have_expected_columns(self, tmp_path: Path) -> None:
         db = tmp_path / "factory.db"
@@ -234,7 +248,7 @@ class TestV3ToV4Upgrade:
         initialize_database(db)
 
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
             assert {"tool_registry", "tool_revisions"} <= _tables(conn)
             project = conn.execute(
                 "SELECT name FROM projects WHERE project_id='p1'"
@@ -250,7 +264,7 @@ class TestV3ToV4Upgrade:
         initialize_database(db)
         initialize_database(db)  # second run must be a no-op
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
             assert _tables(conn).issuperset(
                 {"tool_registry", "tool_revisions", "skill_bindings"}
             )
@@ -286,7 +300,7 @@ class TestV4ToV5Upgrade:
         initialize_database(db)
 
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
             assert "skill_bindings" in _tables(conn)
             tool = conn.execute(
                 "SELECT name FROM tool_registry WHERE tool_id='t_keep'"
@@ -308,7 +322,7 @@ class TestV4ToV5Upgrade:
         initialize_database(db)
         initialize_database(db)  # second run must be a no-op
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
 
 
 class TestNonNegotiablePolicy:
