@@ -61,6 +61,25 @@ class BuilderAgent(BaseAgent):
             }
         ]
 
+        # Bounded repair: a previous deterministic verification of this work
+        # failed. The reason is authoritative context for this re-run and is
+        # never a substitute for running the verification again.
+        repair_context = str(task.metadata.get("repair_context", "") or "").strip()
+        if repair_context:
+            messages[0]["content"] = (
+                f"Task: {task.name}\n"
+                f"Description: {task.description}\n\n"
+                "A previous verification of this work failed. Fix the cause "
+                "before completing. Failure details:\n"
+                f"{repair_context[:4000]}\n\n"
+                "Start working."
+            )
+            self._emit("agent.builder.repair_context_applied", {
+                "task_id": task.task_id,
+                "repair_cycle": task.metadata.get("repair_cycle", 0),
+                "source_task": task.metadata.get("repair_source_task", ""),
+            })
+
         # Task-aware workspace context: deterministic, bounded, read-only
         # excerpts of existing files. Collected once per task so every turn
         # sees the same reference material.

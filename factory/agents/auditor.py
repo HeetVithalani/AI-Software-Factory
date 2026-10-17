@@ -1,7 +1,14 @@
 """
 factory.agents.auditor
 =======================
-Auditor agent — reads audit log events and produces a structured audit report.
+Auditor agent — deterministic final audit (the release gate).
+
+The release decision comes exclusively from
+:mod:`factory.validation.final_audit`, which re-checks persisted facts:
+approved plan identity/hash, pipeline eligibility, completion status,
+absence of uncertain work, evidence presence, and latest evidence file
+hashes. No LLM output participates in the decision; retrying an
+unverifiable state cannot be invented by a model.
 
 Output artifact: <workspace>/audit_report.json
 """
@@ -21,133 +28,131 @@ _MAX_EVENTS = 500
 
 
 class AuditorAgent(BaseAgent):
-    """
-    Reads the audit event log and evaluates evidence using the LLM.
-    """
+    """Runs the deterministic final audit and fails closed on violations."""
 
     agent_type = "auditor"
 
     def run(self, task: TaskRecord) -> AgentResult:
         self._emit("agent.auditor.started", {"task_id": task.task_id})
-        
-        if not self._llm or not self._context:
-            return self._fail(task, "LLM Router or Context Builder not provided to agent")
 
-        project_id = task.project_id or self._project_id
+        project_id = task.project_id or self._project_id or ""
+        plan_id = str(task.metadata.get("plan_id", "") or "")
+        plan_hash = str(task.metadata.get("plan_hash", "") or "")
+        pipeline = str(task.metadata.get("pipeline", "") or "")
+
+        # ------------------------------------------------------------------
+        # Gather persisted facts (never trust in-memory claims)
+        # ------------------------------------------------------------------
+        plan_payload: dict[str, Any] | None = None
+        if plan_id:
+            try:
+                from factory.planning.plan_store import PlanStore
+                version = PlanStore().load(plan_id)
+                if version is not None:
+                    plan_payload = version.plan
+                    if not pipeline:
+                        pipeline = str(
+                            plan_payload.get("pipeline", "") or ""
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Auditor: could not load plan %s: %s", plan_id, exc
+                )
+
+        task_rows: list[Any] = []
+        if project_id:
+            try:
+                from factory.orchestration.task_store import TaskStore
+                task_rows = TaskStore().list_rows(project_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Auditor: could not load task rows: %s", exc
+                )
+
+        from factory.validation.final_audit import run_final_audit
+
+        audit_result = run_final_audit(
+            project_id=project_id,
+            task_rows=task_rows,
+            exclude_task_id=task.task_id,
+            plan=plan_payload,
+            plan_id=plan_id,
+            plan_hash=plan_hash,
+            pipeline=pipeline,
+            workspace_root=self.workspace_root,
+        )
+
         events: list[dict[str, Any]] = []
-
+        type_counts: dict[str, int] = {}
         try:
             from factory.audit.logger import list_events
-            events = list_events(
-                project_id=project_id,
-                limit=_MAX_EVENTS,
-            )
-        except Exception as exc:
+            events = list_events(project_id=project_id, limit=_MAX_EVENTS)
+            for event in events:
+                etype = event.get("event_type", "unknown")
+                type_counts[etype] = type_counts.get(etype, 0) + 1
+        except Exception as exc:  # noqa: BLE001
             logger.warning("AuditorAgent: could not load events: %s", exc)
-            events = []
-
-        # Summarise by event type for context limit
-        type_counts: dict[str, int] = {}
-        approval_events: list[dict[str, Any]] = []
-        error_events: list[dict[str, Any]] = []
-        milestone_events: list[dict[str, Any]] = []
-
-        for event in events:
-            etype = event.get("event_type", "unknown")
-            type_counts[etype] = type_counts.get(etype, 0) + 1
-            if "approval" in etype:
-                approval_events.append(event)
-            elif "fail" in etype or "error" in etype or "denied" in etype:
-                error_events.append(event)
-            elif "completed" in etype:
-                milestone_events.append(event)
-                
-        import json
-        evidence_str = (
-            f"Event Summary: {json.dumps(type_counts)}\n"
-            f"Approval Events: {json.dumps(approval_events)}\n"
-            f"Error Events: {json.dumps(error_events)}\n"
-            f"Milestones: {json.dumps(milestone_events)}\n"
-        )
-        
-        system_prompt = (
-            "You are the Final Auditor Agent. Your goal is to evaluate the complete execution log "
-            "and determine if the project requirements were met and properly verified.\n"
-            "Do NOT blindly approve. You must identify specific evidence such as test successes and reviews.\n"
-            "If evidence is missing or critical errors occurred, set approved to false."
-        )
-        
-        messages = [
-            {"role": "user", "content": f"Please audit the following execution evidence:\n{evidence_str}"}
-        ]
-        
-        from factory.llm.schemas.auditor import AuditorProposal
-        
-        try:
-            request = self._context.build_request(
-                project_id=project_id,
-                system_prompt=system_prompt,
-                messages=messages,
-                response_schema=AuditorProposal,
-                agent_id=self.agent_type,
-            )
-            response = self._llm.complete(request)
-        except Exception as exc:
-            return self._fail(task, f"LLM inference failed: {exc}")
-            
-        if not response.success:
-            return self._fail(task, f"LLM failed: {response.error}")
-            
-        if not response.structured_data:
-            return self._fail(task, "LLM returned no structured output")
-            
-        try:
-            proposal = AuditorProposal.model_validate(response.structured_data)
-        except Exception as exc:
-            return self._fail(task, f"Failed to parse LLM output as AuditorProposal: {exc}")
 
         report = {
             "task_id": task.task_id,
             "project_id": project_id,
+            "plan_id": plan_id,
+            "plan_hash": plan_hash,
+            "pipeline": pipeline,
+            **audit_result.to_dict(),
             "total_events": len(events),
             "event_type_summary": type_counts,
-            "approved": proposal.approved,
-            "requirements_met": proposal.requirements_met,
-            "evidence": proposal.evidence,
-            "missing_evidence": proposal.missing_evidence,
         }
 
         fs = self._make_filesystem_tool()
         write_result = fs.write_json(
             Path("audit_report.json"), report, task_id=task.task_id
         )
-
         if not write_result.success:
             logger.warning(
                 "AuditorAgent: could not write audit_report.json: %s",
                 write_result.error,
             )
 
+        evidence = [{"kind": "audit_report", "path": "audit_report.json"}]
+        outputs = {
+            "report_path": str(self._artifact_path("audit_report.json")),
+            "passed": audit_result.passed,
+            "release_eligible": audit_result.release_eligible,
+            "failed_checks": [
+                check.name for check in audit_result.failed_checks()
+            ],
+            "limitations": audit_result.limitations,
+        }
+
         self._emit("agent.auditor.completed", {
             "task_id": task.task_id,
-            "event_count": len(events),
-            "approved": proposal.approved,
+            "passed": audit_result.passed,
+            "release_eligible": audit_result.release_eligible,
+            "failed_checks": outputs["failed_checks"],
+            "limitations": audit_result.limitations,
         })
 
-        summary = (
-            f"LLM Audit complete. Approved: {proposal.approved}. "
-            f"Evidence points: {len(proposal.evidence)}. "
-            f"Missing evidence: {len(proposal.missing_evidence)}."
-        )
+        if not audit_result.passed:
+            failure = self._fail(
+                task,
+                "Deterministic final audit failed: "
+                + audit_result.failure_summary(),
+            )
+            failure.outputs.update(outputs)
+            failure.evidence = evidence
+            failure.failure_kind = "permanent"
+            return failure
 
-        return self._ok(
-            task,
-            summary=summary,
-            outputs={
-                "report_path": str(self._artifact_path("audit_report.json")),
-                "total_events": len(events),
-                "approved": proposal.approved,
-                "evidence": proposal.evidence,
-            },
-            evidence=[{"kind": "audit_report", "path": "audit_report.json"}],
+        summary = (
+            "Deterministic final audit passed. "
+            f"release_eligible={audit_result.release_eligible}."
         )
+        if audit_result.limitations:
+            summary += (
+                f" Limitations ({len(audit_result.limitations)}): "
+                + "; ".join(limitation[:80] for limitation in
+                            audit_result.limitations[:3])
+            )
+        return self._ok(task, summary=summary, outputs=outputs,
+                        evidence=evidence)

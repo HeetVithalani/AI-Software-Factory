@@ -50,6 +50,11 @@ class FailureKind(str, Enum):
     TRANSIENT = "transient"
     PERMANENT = "permanent"
     UNKNOWN = "unknown"
+    #: A deterministic verification failure (e.g. failing tests) where the
+    #: implementation — not the infrastructure — is at fault. The
+    #: orchestrator may schedule ONE bounded repair cycle if the approved
+    #: plan allows it; otherwise the failure is terminal as usual.
+    REPAIRABLE = "repairable"
 
 
 #: Structured values accepted from ``AgentResult.failure_kind``.

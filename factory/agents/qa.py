@@ -137,4 +137,9 @@ class QAAgent(BaseAgent):
                     "the LLM verdict is recorded in the report but cannot override it."
                 ],
                 evidence=[{"kind": "test_result", "path": "test_report.json"}],
+                # Deterministic verification failure: the implementation is
+                # at fault. The orchestrator decides whether the approved
+                # plan permits one bounded repair cycle; otherwise this is
+                # a terminal failure (never silently retried as transient).
+                failure_kind="repairable",
             )

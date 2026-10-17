@@ -535,6 +535,12 @@ class Orchestrator:
             )
             return
 
+        # ---- Deterministic verification failure → bounded repair ------
+        if kind == FailureKind.REPAIRABLE and self._try_schedule_repair(
+            node, result
+        ):
+            return
+
         # ---- Ordinary failure → bounded retry (COR-004) ---------------
         strategy = str(node.metadata.get("recovery_strategy", "") or "")
         try:
@@ -626,6 +632,157 @@ class Orchestrator:
                     "retry_exhausted": retries_used >= max_retries,
                 },
             )
+
+    # ------------------------------------------------------------------
+    # Bounded repair (deterministic verification failures)
+    # ------------------------------------------------------------------
+
+    def _try_schedule_repair(
+        self, node: TaskNode, result: AgentResult
+    ) -> bool:
+        """
+        Schedule ONE bounded repair cycle for a REPAIRABLE failure.
+
+        Semantics (all deterministic, all from approved plan metadata):
+        * ``metadata.allow_repair`` must be True — otherwise the failure is
+          terminal exactly as before.
+        * ``metadata.max_repair_cycles`` caps the number of repair rounds;
+          ``metadata.repair_attempts`` counts the ones already used.
+        * The single builder dependency of the failed verification task is
+          re-queued with a bounded ``repair_context``; completed downstream
+          work that depends on that builder is invalidated (re-verified),
+          because its verification applied to stale code.
+        * Human-parked approvals and human skips are never silently reset.
+        * Returns True when a repair was scheduled; False leaves the
+          ordinary terminal-failure path untouched.
+        """
+        if not bool(node.metadata.get("allow_repair", False)):
+            if self._audit:
+                self._audit.emit("task.repair_not_allowed", {
+                    "task_id": node.task_id,
+                    "reason": "approved plan does not allow repair",
+                })
+            return False
+
+        try:
+            max_cycles = max(0, int(node.metadata.get("max_repair_cycles", 0)))
+        except (TypeError, ValueError):
+            max_cycles = 0
+        try:
+            used = max(0, int(node.metadata.get("repair_attempts", 0)))
+        except (TypeError, ValueError):
+            used = 0
+        if max_cycles == 0 or used >= max_cycles:
+            if self._audit:
+                self._audit.emit("task.repair_exhausted", {
+                    "task_id": node.task_id,
+                    "repair_attempts": used,
+                    "max_repair_cycles": max_cycles,
+                    "errors": result.errors,
+                })
+            return False
+
+        target: TaskNode | None = None
+        for dep_id in node.depends_on:
+            dep = self.dag.get(dep_id)
+            if dep is not None and dep.agent_type == "builder":
+                target = dep
+                break
+        if target is None:
+            if self._audit:
+                self._audit.emit("task.repair_unavailable", {
+                    "task_id": node.task_id,
+                    "reason": "no builder dependency to repair",
+                })
+            return False
+
+        details = "\n".join(result.errors) or result.summary or (
+            "verification failed without details"
+        )
+        repair_context = details[:4000]
+        # Use the failed artifact (e.g. test_report.json) as the repair
+        # reference when the producer declared one.
+        for item in result.evidence or []:
+            if isinstance(item, dict) and item.get("path"):
+                repair_context += (
+                    f"\nVerification artifact: {item['path']}"
+                )
+                break
+
+        attempt = used + 1
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Invalidate completed/failed downstream work that depends on the
+        # builder: its verification no longer reflects the repaired code.
+        def _dependents(root_id: str) -> set[str]:
+            found: set[str] = set()
+            stack = [root_id]
+            while stack:
+                current = stack.pop()
+                for candidate in self.dag.all_nodes():
+                    if (
+                        current in candidate.depends_on
+                        and candidate.task_id not in found
+                    ):
+                        found.add(candidate.task_id)
+                        stack.append(candidate.task_id)
+            return found
+
+        invalidated: list[str] = []
+        for tid in sorted(_dependents(target.task_id)):
+            if tid == node.task_id:
+                continue
+            dependent = self.dag.get(tid)
+            if dependent is None:
+                continue
+            if dependent.status in (
+                TaskStatus.PENDING,
+                TaskStatus.RUNNING,
+                TaskStatus.AWAITING_APPROVAL,
+                TaskStatus.SKIPPED,
+            ):
+                # Never silently reset parked approvals or human skips.
+                continue
+            previous_status = dependent.status
+            self.dag.update_status(tid, TaskStatus.PENDING)
+            if previous_status == TaskStatus.COMPLETED:
+                self._tasks_completed = max(0, self._tasks_completed - 1)
+            dependent.metadata["invalidated_by_repair"] = timestamp
+            dependent.metadata.pop("terminal_failure", None)
+            self._persist_node(dependent)
+            invalidated.append(tid)
+
+        # Re-queue the builder with the bounded repair context.
+        target.metadata["repair_context"] = repair_context
+        target.metadata["repair_source_task"] = node.task_id
+        target.metadata["repair_cycle"] = attempt
+        target.metadata.pop("terminal_failure", None)
+        if target.status == TaskStatus.COMPLETED:
+            self._tasks_completed = max(0, self._tasks_completed - 1)
+        self.dag.update_status(target.task_id, TaskStatus.PENDING)
+        self._persist_node(target)
+
+        # Re-queue the failed verification task with the incremented count.
+        node.metadata["repair_attempts"] = attempt
+        node.metadata.pop("terminal_failure", None)
+        self.dag.update_status(node.task_id, TaskStatus.PENDING)
+
+        if self._audit:
+            self._audit.emit("task.repair_scheduled", {
+                "task_id": node.task_id,
+                "repair_target": target.task_id,
+                "repair_cycle": attempt,
+                "max_repair_cycles": max_cycles,
+                "invalidated_tasks": invalidated,
+                "errors": result.errors,
+            })
+        logger.warning(
+            "Task %s failed verification — repair cycle %d/%d scheduled "
+            "(builder=%s, invalidated=%s).",
+            node.task_id, attempt, max_cycles, target.task_id,
+            invalidated or "none",
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Requeue passes (COR-008 / COR-003)
