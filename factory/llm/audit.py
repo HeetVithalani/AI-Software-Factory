@@ -27,9 +27,13 @@ class LLMCallAuditor:
         """Persist a completed LLM call (success or failure)."""
         provider_name = request.model.split(":")[0] if ":" in request.model else "unknown"
         
-        # Strip potentially sensitive content from raw_response if needed
-        # (Sanitization happens upstream in context builder, but we could add another pass here)
-        raw_response = response.content
+        # Defense-in-depth (SEC-008): the model response can echo
+        # secrets that were present in context; redact them before they
+        # reach the database. Only placeholders are stored — the raw
+        # values are never persisted or logged.
+        from factory.llm.sanitizer import redact_text
+        raw_response = redact_text(response.content).text
+        error_text = redact_text(response.error or "").text
         structured = to_json(response.structured_data) if response.structured_data else "{}"
 
         try:
@@ -57,7 +61,7 @@ class LLMCallAuditor:
                         response.tokens_out,
                         retry_count,
                         raw_response,
-                        response.error,
+                        error_text,
                         structured,
                     )
                 )
