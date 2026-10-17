@@ -5,11 +5,12 @@ Main CLI for the AI Software Factory.
 
 Commands:
   factory status
-  factory run <project_path> [--plan <plan.json>] [--task-desc "..."]
-  factory approvals list [--status pending|approved|denied] [--project <id>]
-  factory approvals show  <request_id>
-  factory approvals grant <request_id> [--note "reason"]
-  factory approvals deny  <request_id> [--note "reason"]
+  factory run <project_path> [--plan <plan.json>] [--task-desc "..."] [--model M]
+  factory run --plan-id <plan_id> [--model M]
+  factory plan create|list|show|approve|reject
+  factory tasks|evidence|audit [--project <id>]
+  factory recovery status|resolve
+  factory approvals list|show|grant|deny
   factory intake discover|fetch|scan|check|approve|install|status|disable
 """
 
@@ -43,6 +44,14 @@ from factory.cli.intake_cmd import (
     register_intake_subparser,
     dispatch_intake,
 )
+from factory.cli.plan_cmd import (
+    register_plan_subparser,
+    dispatch_plan,
+)
+from factory.cli.inspect_cmd import (
+    register_inspect_subparsers,
+    dispatch_inspect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +63,12 @@ def run_status() -> int:
     return 0
 
 
-def run_project(project_path: str, task_desc: str, plan_arg: str | None) -> int:
+def run_project(
+    project_path: str,
+    task_desc: str,
+    plan_arg: str | None,
+    model: str | None = None,
+) -> int:
     path = Path(project_path).resolve()
     print(f"Running factory on project at {path}")
 
@@ -77,7 +91,11 @@ def run_project(project_path: str, task_desc: str, plan_arg: str | None) -> int:
         project_key=project_key_for(path),
         audit_logger=audit_logger,
     )
-    context_builder = ContextBuilder(state=state, skill_provider=skill_provider)
+    if model:
+        print(f"Per-run model override: {model}")
+    context_builder = ContextBuilder(
+        state=state, skill_provider=skill_provider, default_model=model,
+    )
     settings = get_settings()
 
     # ------------------------------------------------------------------
@@ -195,17 +213,32 @@ def main() -> int:
     subparsers.add_parser("status", help="Show factory status")
 
     run_parser = subparsers.add_parser("run", help="Run factory on a project")
-    run_parser.add_argument("project_path", type=str)
+    run_parser.add_argument("project_path", type=str, nargs="?", default="",
+                            help="Project workspace (required unless --plan-id)")
     run_parser.add_argument("--task-desc", type=str, default="",
                             help="Override task description (used in fallback mode)")
     run_parser.add_argument("--plan", type=str, default=None,
                             help="Path to plan.json (default: <project>/plan.json)")
+    run_parser.add_argument("--plan-id", type=str, default=None,
+                            help="Execute an approved persisted plan "
+                                 "(created with 'factory plan create')")
+    run_parser.add_argument("--model", type=str, default=None,
+                            help="Per-run model override (e.g. "
+                                 "ollama:qwen2.5-coder:7b-agent). Applies to "
+                                 "this run only; the configured default is "
+                                 "unchanged.")
 
     # Approvals sub-command
     register_approvals_subparser(subparsers)
 
     # Tool/skill intake sub-command (Phase 2a)
     register_intake_subparser(subparsers)
+
+    # Plan lifecycle (RPI): create/list/show/approve/reject
+    register_plan_subparser(subparsers)
+
+    # Read-only inspection + recovery resolution
+    register_inspect_subparsers(subparsers)
 
     args = parser.parse_args()
 
@@ -215,11 +248,22 @@ def main() -> int:
     if args.command == "status":
         return run_status()
     elif args.command == "run":
-        return run_project(args.project_path, args.task_desc, args.plan)
+        if args.plan_id:
+            from factory.cli.plan_exec import run_approved_plan
+            return run_approved_plan(args)
+        if not args.project_path:
+            parser.error("project_path is required unless --plan-id is given")
+        return run_project(
+            args.project_path, args.task_desc, args.plan, model=args.model,
+        )
     elif args.command == "approvals":
         return dispatch_approvals(args)
     elif args.command == "intake":
         return dispatch_intake(args)
+    elif args.command == "plan":
+        return dispatch_plan(args)
+    elif args.command in ("tasks", "evidence", "audit", "recovery"):
+        return dispatch_inspect(args)
 
     return 1
 

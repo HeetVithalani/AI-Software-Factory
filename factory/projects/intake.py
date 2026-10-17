@@ -204,3 +204,52 @@ class ProjectIntake:
                 (st, now, project_id),
             )
             conn.commit()
+
+    def update_profile(
+        self, project_id: str, profile: QualityProfile
+    ) -> None:
+        """Update a project's quality profile in the DB."""
+        from factory.database import get_connection
+        from datetime import datetime, timezone
+        value = profile.value if hasattr(profile, "value") else str(profile)
+        now = datetime.now(timezone.utc).isoformat()
+        with get_connection(self._db_path) as conn:
+            conn.execute(
+                "UPDATE projects SET quality_profile = ?, updated_at = ? "
+                "WHERE project_id = ?",
+                (value, now, project_id),
+            )
+            conn.commit()
+
+    def find_by_workspace(self, workspace_root: Path) -> ProjectRecord | None:
+        """
+        Find the project registered for an exact workspace path.
+
+        Comparison uses the resolved path string, the same identity the
+        skills provider derives its project key from.
+        """
+        from factory.database import get_connection
+
+        candidate = str(Path(workspace_root).resolve())
+        with get_connection(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT project_id FROM projects WHERE workspace_path = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (candidate,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self.load(row["project_id"])
+
+    def latest_project(self) -> ProjectRecord | None:
+        """Return the most recently updated project, if any."""
+        from factory.database import get_connection
+
+        with get_connection(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT project_id FROM projects ORDER BY updated_at DESC "
+                "LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return self.load(row["project_id"])

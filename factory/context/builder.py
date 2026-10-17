@@ -28,11 +28,20 @@ class ContextBuilder:
     Prevents dumping the whole project into the prompt.
     """
 
-    def __init__(self, state: FactoryState, skill_provider: Any = None) -> None:
+    def __init__(
+        self,
+        state: FactoryState,
+        skill_provider: Any = None,
+        default_model: str | None = None,
+    ) -> None:
         self.state = state
         # Phase 2c: optional skill-context provider (explicit per-run
         # integration point). None keeps pre-2c behavior byte-for-byte.
         self.skill_provider = skill_provider
+        # Per-run model override. When set, it takes precedence over the
+        # configured default for this process only; the global setting is
+        # never modified.
+        self.default_model = default_model or None
         self.persister = ContextPersister()
         
     def _estimate_tokens(self, text: str) -> int:
@@ -64,11 +73,14 @@ class ContextBuilder:
         if task_id is None:
             task_id = kwargs.get("task_id") or f"task-{uuid.uuid4().hex[:8]}"
 
-        # Model selection: caller override → settings.models.default_model
-        # This is the single authoritative model resolution point.
+        # Model selection: caller override -> per-run default -> configured
+        # default. This is the single authoritative model resolution point.
         if model is None:
-            from factory.config import get_settings
-            model = get_settings().models.default_model
+            if self.default_model:
+                model = self.default_model
+            else:
+                from factory.config import get_settings
+                model = get_settings().models.default_model
         """Build the LLMRequest and save the manifest."""
 
         # Phase 2c: append explicitly project-enabled skill reference
