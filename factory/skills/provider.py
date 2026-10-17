@@ -83,9 +83,39 @@ _SKILL_OPEN = (
 )
 _SKILL_CLOSE = "--- end skill reference: tool={tool_id} ---\n"
 _TRUNCATION_MARKER = "\n[truncated: showing first {kept} of {total} characters]\n"
-# Sentinels that must never survive verbatim inside injected content,
-# so skill text cannot forge its own framing/closing markers.
-_DELIMITER_SENTINELS = (UNTRUSTED_FOOTER.strip(), "--- end skill reference:")
+# Inner per-skill marker prefixes, derived from the framing templates
+# above so a future marker edit automatically updates neutralization.
+_SKILL_OPEN_PREFIX = _SKILL_OPEN.split(":", 1)[0] + ":"    # "--- skill reference:"
+_SKILL_CLOSE_PREFIX = _SKILL_CLOSE.split(":", 1)[0] + ":"  # "--- end skill reference:"
+
+# Complete set of literal framing sentinels that must never survive
+# verbatim inside injected skill bodies, so content cannot forge its own
+# framing. Derived from the framing constants above — the outer header
+# block and its opening marker line, the outer footer marker, and the
+# inner per-skill open/close prefixes (the full per-skill lines carry
+# live tool ids, so only the fixed prefixes can be forged generically).
+# Matching is CASE-INSENSITIVE: framing is machine-emitted ASCII, and a
+# letter-case variant must not be able to visually re-create a boundary
+# for the reader. Every other byte of skill content is preserved.
+_DELIMITER_SENTINELS = (
+    UNTRUSTED_HEADER,                   # outer header block
+    UNTRUSTED_HEADER.splitlines()[0],   # outer header opening marker
+    UNTRUSTED_FOOTER.strip(),           # outer footer marker
+    _SKILL_OPEN_PREFIX,                 # inner open prefix
+    _SKILL_CLOSE_PREFIX,                # inner close prefix
+)
+
+# Single-pass, longest-first alternation: the header block contains its
+# own opening marker line, so overlapping sentinels must be replaced in
+# one pass (longest first, then lexicographic for a fully deterministic
+# pattern) rather than sequentially in an order-sensitive loop.
+_DELIMITER_PATTERN = re.compile(
+    "|".join(
+        re.escape(s)
+        for s in sorted(set(_DELIMITER_SENTINELS), key=lambda s: (-len(s), s))
+    ),
+    re.IGNORECASE,
+)
 
 # Generic terms that must not drive relevance on their own.
 _STOPWORDS = frozenset({
@@ -158,10 +188,18 @@ def parse_skill_markdown(text: str) -> tuple[dict[str, str], str] | None:
 
 
 def _sanitize_body(body: str) -> str:
-    """Neutralize framing sentinels so content cannot forge its own marks."""
-    for sentinel in _DELIMITER_SENTINELS:
-        body = body.replace(sentinel, "[removed delimiter]")
-    return body
+    """
+    Neutralize framing sentinels so content cannot forge its own marks.
+
+    Replaces every occurrence of the outer header block and its opening
+    marker line, the outer footer marker, and the inner
+    ``--- skill reference:`` / ``--- end skill reference:`` prefixes —
+    in ANY letter case — with ``[removed delimiter]``. Sanitization
+    runs on the whole body BEFORE truncation (a later cut can never
+    reassemble a sentinel), and all other skill content is preserved
+    byte-for-byte.
+    """
+    return _DELIMITER_PATTERN.sub("[removed delimiter]", body)
 
 
 # ---------------------------------------------------------------------------
@@ -476,15 +514,28 @@ class SkillContextProvider:
         """
         Build the bounded, attributed, untrusted-framed block.
 
+        ``aggregate_max_chars`` is a HARD maximum for the COMPLETE
+        block: the outer header + footer framing length is reserved
+        FIRST and the per-skill segments (attribution open/close marks,
+        body text, truncation marker) are selected from what remains,
+        so the returned block can never exceed the configured cap.
         Deterministic: per-skill truncation at ``per_skill_max_chars``
-        with an explicit marker, then a hard aggregate budget; skills
-        that no longer fit are dropped (never partially injected below
-        the minimum viable excerpt).
+        with an explicit marker, then the remaining budget; a skill
+        that still does not fit is dropped (never partially injected
+        below the minimum viable excerpt). When the cap cannot hold
+        the framing plus at least one viable excerpt, NOTHING is
+        injected and every candidate is reported as capped — a
+        framing-only block is never returned.
         """
         if not candidates:
             return "", [], []
-        budget = self.aggregate_max_chars
-        parts = [UNTRUSTED_HEADER]
+        framing = len(UNTRUSTED_HEADER) + len(UNTRUSTED_FOOTER)
+        if self.aggregate_max_chars <= framing:
+            # The cap cannot even hold the outer framing itself:
+            # no block at all, every candidate capped.
+            return "", [], list(candidates)
+        budget = self.aggregate_max_chars - framing
+        parts: list[str] = []
         injected: list[SelectedSkill] = []
         capped: list[SelectedSkill] = []
         for cand in candidates:
@@ -504,7 +555,17 @@ class SkillContextProvider:
                 marker = _TRUNCATION_MARKER.format(kept=len(body), total=total)
             needed = len(open_mark) + len(body) + len(marker) + len(close_mark)
             if needed > budget:
-                room = budget - len(open_mark) - len(marker) - len(close_mark)
+                # Aggregate shrink. Probe the truncation marker's length
+                # at the LARGEST possible kept length: kept never exceeds
+                # it, so the marker can only shrink afterwards — the
+                # recomputed segment is then always within budget (the
+                # probe itself may over-reserve by a digit or two, which
+                # only makes the bound stricter).
+                span = budget - len(open_mark) - len(close_mark)
+                probe_marker = _TRUNCATION_MARKER.format(
+                    kept=max(span, 0), total=total
+                )
+                room = span - len(probe_marker)
                 if room >= 64:
                     body = body[:room]
                     truncated = True
@@ -525,8 +586,11 @@ class SkillContextProvider:
             parts.append(close_mark)
             budget -= needed
             injected.append(replace(cand, body="", truncated=truncated))
-        parts.append(UNTRUSTED_FOOTER)
-        return "".join(parts), injected, capped
+        if not injected:
+            # Not even one viable excerpt fit inside the cap: never
+            # emit a framing-only wrapper; all candidates stay capped.
+            return "", [], capped
+        return UNTRUSTED_HEADER + "".join(parts) + UNTRUSTED_FOOTER, injected, capped
 
     def _audit_selection(
         self,
