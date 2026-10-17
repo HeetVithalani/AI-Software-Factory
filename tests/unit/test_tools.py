@@ -153,9 +153,12 @@ class TestBaseSandbox:
 
 class TestShellTool:
     def test_safe_command_runs_without_broker(self, tmp_path):
+        # Contract update (SEC-002): shell builtins like `echo` are no
+        # longer available (no shell); a real program is used instead.
+        # Assertions unchanged: a safe command runs without a broker.
         from factory.tools.shell import ShellTool
         tool = ShellTool(workspace_root=tmp_path)
-        result = tool.run_safe("echo hello")
+        result = tool.run_safe("python -c \"print('hello')\"")
         assert result.success
         assert "hello" in result.output.strip()
 
@@ -189,10 +192,11 @@ class TestShellTool:
         assert "approval" in result.error.lower()
 
     def test_approved_command_executes(self, tmp_path):
+        # Contract update (SEC-002): real program instead of `echo` builtin.
         from factory.tools.shell import ShellTool
         broker = _broker_always_approve()
         tool = ShellTool(workspace_root=tmp_path, broker=broker)
-        result = tool.run("echo approved")
+        result = tool.run("python -c \"print('approved')\"")
         assert result.success
         assert "approved" in result.output
 
@@ -218,10 +222,158 @@ class TestShellTool:
         assert not result.success
 
     def test_duration_populated(self, tmp_path):
+        # Contract update (SEC-002): real program instead of `echo` builtin.
         from factory.tools.shell import ShellTool
         tool = ShellTool(workspace_root=tmp_path)
-        result = tool.run_safe("echo x")
+        result = tool.run_safe("python -c \"print('x')\"")
         assert result.duration_ms > 0
+
+
+# ---------------------------------------------------------------------------
+# ShellTool — non-shell execution (SEC-002 regression suite)
+# ---------------------------------------------------------------------------
+
+class TestShellNonShellExecution:
+    """Structured execution: operators rejected, argv execution, exact approvals."""
+
+    # -- rejected operators / injection attempts ---------------------------
+
+    @pytest.mark.parametrize("cmd", [
+        "python -c \"print(1)\" ; rm -rf /",
+        "python -c \"print(1)\" && rm -rf /",
+        "python -c \"print(1)\" || echo fallback",
+        "type x | findstr secret",
+        "python x.py > C:\\Windows\\System32\\evil.dll",
+        "python x.py >> append.log",
+        "python x.py < input.txt",
+        "`whoami`",
+        "python $(evil).py",
+        "python ${EVIL}.py",
+        "echo a & echo b",
+    ])
+    def test_unquoted_operators_rejected(self, tmp_path, cmd):
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run(cmd)
+        assert not result.success
+        # Never executed — parser rejection before anything else
+        assert "operator" in result.error.lower()
+
+    def test_quoted_semicolon_is_argument_content(self, tmp_path):
+        """A ';' inside quotes is legitimate argument text and runs."""
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run_safe("python -c \"import sys; sys.exit(3)\"")
+        assert result.returncode == 3
+        assert not result.success
+
+    def test_quoted_arg_with_spaces_preserved(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run_safe("python -c \"print('a b c')\"")
+        assert result.success
+        assert result.output.strip() == "a b c"
+
+    def test_command_injection_attempt_rejected(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run(
+            "python -c \"print('x')\" & del /f /q C:\\Windows"
+        )
+        assert not result.success
+        assert "operator" in result.error.lower()
+
+    # -- explicit shells and batch scripts refused -------------------------
+
+    @pytest.mark.parametrize("cmd", [
+        "cmd /c dir",
+        "powershell -Command Get-ChildItem",
+        "bash -c ls",
+        "sh -c whoami",
+    ])
+    def test_shell_interpreters_rejected(self, tmp_path, cmd):
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run(cmd)
+        assert not result.success
+        assert "shell interpreter" in result.error.lower()
+
+    def test_batch_script_rejected(self, tmp_path):
+        import sys
+        if sys.platform != "win32":
+            pytest.skip("batch scripts are a Windows-only concept")
+        (tmp_path / "evil.bat").write_text("@echo off\r\nwhoami\r\n")
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run("evil.bat")
+        assert not result.success
+        assert "batch" in result.error.lower()
+
+    # -- resolution and execution ------------------------------------------
+
+    def test_executable_not_found_controlled_failure(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path, broker=_broker_always_approve())
+        result = tool.run("definitely-not-a-real-cmd-xyz --flag")
+        assert not result.success
+        assert "not found" in result.error.lower()
+
+    def test_relative_script_resolved_against_workspace(self, tmp_path):
+        import sys
+        (tmp_path / "hello.py").write_text("print('from-script')\n")
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run("python hello.py")
+        assert result.success
+        assert "from-script" in result.output
+        # The executed executable is the absolute resolved interpreter
+        assert Path(result.metadata["executable"]).is_absolute()
+
+    def test_argv_execution_passes_operators_as_arguments(self, tmp_path):
+        import sys
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run_argv(
+            [sys.executable, "-c", "print('a;b|c&d')"],
+        )
+        assert result.success
+        assert result.output.strip() == "a;b|c&d"
+
+    def test_run_argv_rejects_empty_and_shells(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        assert not tool.run_argv([]).success
+        assert not tool.run_argv(["cmd", "/c", "dir"]).success
+
+    # -- approval describes the exact operation ----------------------------
+
+    def test_approval_records_canonical_operation(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        broker = _broker_always_pending()
+        tool = ShellTool(workspace_root=tmp_path, broker=broker)
+        result = tool.run("unknowncmd --flag pytest")
+        assert not result.success
+        # The broker saw the exact canonical operation (program + args)
+        call = broker.check.call_args
+        action = call.kwargs.get("action") or call.args[1]
+        ctx = call.kwargs.get("ctx") or call.args[0]
+        assert action.startswith("shell: unknowncmd")
+        assert "pytest" in action
+        assert ctx.command in action
+
+    def test_unbalanced_quotes_rejected_as_ambiguous(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path)
+        result = tool.run("python -c \"print('unbalanced)")
+        assert not result.success
+        assert "ambiguous" in result.error.lower()
+
+    def test_timeout_still_bounded(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        tool = ShellTool(workspace_root=tmp_path, timeout=1)
+        result = tool.run_safe("python -c \"import time; time.sleep(5)\"")
+        assert not result.success
+        assert "timed out" in result.error.lower()
 
 
 # ---------------------------------------------------------------------------
