@@ -132,7 +132,8 @@ def run_approved_plan(args) -> int:
     audit = AuditLogger(project_id=plan.project_id)
     broker = PermissionBroker(policies=load_policies())
     llm_router = LLMRouter()
-    state = StateManager().boot_state()
+    state_manager = StateManager()
+    state = state_manager.boot_state()
     model_override = getattr(args, "model", None) or None
     if model_override:
         print(f"Per-run model override: {model_override}")
@@ -205,7 +206,7 @@ def run_approved_plan(args) -> int:
         config=OrchestratorConfig(
             default_max_retries=int(policy.default_max_retries),
         ),
-        state_manager=state,
+        state_manager=state_manager,
         recovery_manager=recovery_manager,
         audit_logger=audit,
         permission_broker=broker,

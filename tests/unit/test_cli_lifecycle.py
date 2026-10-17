@@ -311,6 +311,69 @@ class TestInspectCli:
         assert "No projects" in out
 
 
+class TestApprovedPlanExecutionWiring:
+    """
+    Guards the wiring between the CLI execution path and the Orchestrator.
+
+    Regression: ``run_approved_plan`` once passed the booted ``FactoryState``
+    where the Orchestrator requires the ``StateManager``; the live CLI run
+    died immediately with ``'FactoryState' object has no attribute
+    'check_emergency_stop_file'``. A stubbed orchestrator keeps this test
+    model-free while asserting the exact contract.
+    """
+
+    def test_run_wires_state_manager_and_agent_kwargs(self, cli_env, monkeypatch):
+        plan_id = _create_plan(cli_env, monkeypatch)
+        plan = PlanStore().load(plan_id)
+        rc = _run_cli(monkeypatch, [
+            "plan", "approve", plan_id, "--hash", plan.plan_hash,
+            "--by", "tester",
+        ])
+        assert rc == 0
+
+        captured: dict = {}
+
+        class _StubOrchestrator:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run(self):
+                class _Status:
+                    value = "idle"
+                return _Status()
+
+        import factory.cli.plan_exec as plan_exec
+
+        def _stub_register(orch, **kwargs):
+            captured["agent_kwargs"] = kwargs
+            return ["builder"]
+
+        monkeypatch.setattr(plan_exec, "Orchestrator", _StubOrchestrator)
+        monkeypatch.setattr(plan_exec, "register_all_agents", _stub_register)
+
+        rc = _run_cli(monkeypatch, [
+            "run", "--plan-id", plan_id,
+            "--model", "ollama:qwen2.5-coder:7b-agent",
+        ])
+        assert rc == 0
+
+        # The orchestrator must receive the state MANAGER, not a booted state.
+        sm = captured["state_manager"]
+        assert hasattr(sm, "check_emergency_stop_file")
+        assert hasattr(sm, "boot_state")
+
+        assert captured["plan_id"] == plan_id
+        assert captured["plan_hash"] == plan.plan_hash
+        assert captured["project_id"] == plan.project_id
+
+        # Per-run model override reaches the single context resolution point.
+        agent_kwargs = captured["agent_kwargs"]
+        assert (
+            agent_kwargs["context_builder"].default_model
+            == "ollama:qwen2.5-coder:7b-agent"
+        )
+
+
 class TestProjectIntakeHelpers:
     def test_find_by_workspace_and_update_profile(self, cli_env, monkeypatch):
         _create_plan(cli_env, monkeypatch)
