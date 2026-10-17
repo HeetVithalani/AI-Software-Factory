@@ -254,6 +254,49 @@ class TestBoundedRepair:
         assert "repair_attempts" not in dag.get("test-1").metadata
 
 
+class TestPlanIdentityPropagation:
+    def test_dispatched_agents_receive_plan_identity(self):
+        dag = TaskDAG()
+        dag.add(_task("builder", "build-1"))
+        captured: dict = {}
+
+        def builder(task):
+            captured.update(task.metadata)
+            return _ok(task.task_id, "builder")
+
+        orch = Orchestrator(
+            dag,
+            config=OrchestratorConfig(poll_interval_seconds=0.0),
+            plan_id="plan-abc",
+            plan_hash="f" * 64,
+        )
+        orch.register_executor("builder", builder)
+        orch.run(max_steps=10)
+
+        assert captured["plan_id"] == "plan-abc"
+        assert captured["plan_hash"] == "f" * 64
+        # Persisted on the node so recovery/audit see the same identity.
+        assert dag.get("build-1").metadata["plan_id"] == "plan-abc"
+
+    def test_explicit_task_metadata_wins_over_run_identity(self):
+        dag = TaskDAG()
+        dag.add(_task("builder", "build-1", plan_id="task-level"))
+        captured: dict = {}
+
+        def builder(task):
+            captured.update(task.metadata)
+            return _ok(task.task_id, "builder")
+
+        orch = Orchestrator(
+            dag,
+            config=OrchestratorConfig(poll_interval_seconds=0.0),
+            plan_id="run-level",
+        )
+        orch.register_executor("builder", builder)
+        orch.run(max_steps=10)
+        assert captured["plan_id"] == "task-level"
+
+
 # ---------------------------------------------------------------------------
 # Final audit
 # ---------------------------------------------------------------------------

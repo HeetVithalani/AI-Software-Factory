@@ -339,6 +339,14 @@ class Orchestrator:
                 errors=[f"No executor registered for agent_type={node.agent_type!r}"],
             )
 
+        # Expose the run's plan identity to every dispatched agent (persisted
+        # with the task row). The auditor verifies approval/hash from this;
+        # setdefault keeps any explicit per-task values intact.
+        if self._plan_id:
+            node.metadata.setdefault("plan_id", self._plan_id)
+        if self._plan_hash:
+            node.metadata.setdefault("plan_hash", self._plan_hash)
+
         # Build a TaskRecord for the executor
         record = TaskRecord(
             task_id=node.task_id,
