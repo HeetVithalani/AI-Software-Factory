@@ -19,7 +19,7 @@ from factory.config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
@@ -418,6 +418,95 @@ def _migrate_v6(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v7(conn: sqlite3.Connection) -> None:
+    """
+    Add RPI workflow persistence (schema v7):
+
+    * ``project_briefs`` — immutable normalised brief versions, each with
+      the verbatim original specification and its SHA-256.
+    * ``research_records`` — research summaries with provenance sources.
+    * ``plans`` — immutable plan versions with a canonical content hash.
+    * ``plan_approvals`` — append-only human decisions bound to the exact
+      plan hash. A decision is only valid for the hash it names; a new plan
+      version can never inherit an older approval.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_briefs (
+            brief_id        TEXT PRIMARY KEY,
+            project_id      TEXT NOT NULL,
+            name            TEXT NOT NULL DEFAULT '',
+            source_kind     TEXT NOT NULL DEFAULT 'text',
+            source_reference TEXT NOT NULL DEFAULT '',
+            source_sha256   TEXT NOT NULL DEFAULT '',
+            original_spec   TEXT NOT NULL DEFAULT '',
+            brief_json      TEXT NOT NULL DEFAULT '{}',
+            created_at      TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_briefs_project "
+        "ON project_briefs(project_id)"
+    )
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS research_records (
+            research_id     TEXT PRIMARY KEY,
+            project_id      TEXT NOT NULL,
+            brief_id        TEXT,
+            topic           TEXT NOT NULL DEFAULT '',
+            summary_json    TEXT NOT NULL DEFAULT '{}',
+            limitations_json TEXT NOT NULL DEFAULT '[]',
+            created_at      TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_research_records_project "
+        "ON research_records(project_id)"
+    )
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS plans (
+            plan_id         TEXT PRIMARY KEY,
+            project_id      TEXT NOT NULL,
+            version         INTEGER NOT NULL,
+            plan_hash       TEXT NOT NULL,
+            plan_json       TEXT NOT NULL,
+            brief_id        TEXT NOT NULL DEFAULT '',
+            research_id     TEXT NOT NULL DEFAULT '',
+            status          TEXT NOT NULL DEFAULT 'pending',
+            pipeline        TEXT NOT NULL DEFAULT 'standard',
+            profile         TEXT NOT NULL DEFAULT 'balanced',
+            created_by      TEXT NOT NULL DEFAULT 'deterministic-planner',
+            parent_plan_id  TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            UNIQUE (project_id, version)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plans_project ON plans(project_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status)"
+    )
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS plan_approvals (
+            approval_id     TEXT PRIMARY KEY,
+            plan_id         TEXT NOT NULL,
+            plan_hash       TEXT NOT NULL,
+            decision        TEXT NOT NULL,
+            actor           TEXT NOT NULL,
+            note            TEXT NOT NULL DEFAULT '',
+            decided_at      TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plan_approvals_plan "
+        "ON plan_approvals(plan_id)"
+    )
+
+
 def initialize_database(db_path: Path | None = None) -> None:
     """
     Create or migrate the factory database to the current schema version.
@@ -474,6 +563,15 @@ def initialize_database(db_path: Path | None = None) -> None:
             _migrate_v6(conn)
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (6,)
+            )
+
+        if current < 7:
+            logger.info(
+                "Applying schema migration v7 (briefs/research/plans/approvals)…"
+            )
+            _migrate_v7(conn)
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (7,)
             )
 
         conn.commit()

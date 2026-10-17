@@ -71,18 +71,20 @@ def _make_v4_db(db_path: Path) -> None:
 
 
 class TestFreshDatabase:
-    def test_fresh_db_reaches_v6(self, tmp_path: Path) -> None:
+    def test_fresh_db_reaches_current_version(self, tmp_path: Path) -> None:
         db = tmp_path / "factory.db"
         initialize_database(db)
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]
             tables = _tables(conn)
             assert {
                 "tool_registry", "tool_revisions", "skill_bindings",
+                "project_briefs", "research_records", "plans",
+                "plan_approvals",
             } <= tables
 
     def test_current_version_constant(self) -> None:
-        assert CURRENT_SCHEMA_VERSION == 6
+        assert CURRENT_SCHEMA_VERSION == 7
 
     def test_v6_approval_fingerprint_column(self, tmp_path: Path) -> None:
         """SEC-006: approvals carry the exact-operation fingerprint."""
@@ -248,7 +250,7 @@ class TestV3ToV4Upgrade:
         initialize_database(db)
 
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]
             assert {"tool_registry", "tool_revisions"} <= _tables(conn)
             project = conn.execute(
                 "SELECT name FROM projects WHERE project_id='p1'"
@@ -264,7 +266,7 @@ class TestV3ToV4Upgrade:
         initialize_database(db)
         initialize_database(db)  # second run must be a no-op
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]
             assert _tables(conn).issuperset(
                 {"tool_registry", "tool_revisions", "skill_bindings"}
             )
@@ -300,7 +302,7 @@ class TestV4ToV5Upgrade:
         initialize_database(db)
 
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]
             assert "skill_bindings" in _tables(conn)
             tool = conn.execute(
                 "SELECT name FROM tool_registry WHERE tool_id='t_keep'"
@@ -322,7 +324,99 @@ class TestV4ToV5Upgrade:
         initialize_database(db)
         initialize_database(db)  # second run must be a no-op
         with get_connection(db) as conn:
-            assert _versions(conn) == [1, 2, 3, 4, 5, 6]
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]
+
+
+class TestV6ToV7Upgrade:
+    """Schema v7: persisted briefs, research, plans, and plan approvals."""
+
+    def _make_v6_db(self, db_path: Path) -> None:
+        initialize_database(db_path)
+        with get_connection(db_path) as conn:
+            conn.execute("DROP TABLE plan_approvals")
+            conn.execute("DROP TABLE plans")
+            conn.execute("DROP TABLE research_records")
+            conn.execute("DROP TABLE project_briefs")
+            conn.execute("DELETE FROM schema_version WHERE version = 7")
+            conn.commit()
+
+    def test_upgrade_creates_v7_tables_and_preserves_data(
+        self, tmp_path: Path
+    ) -> None:
+        db = tmp_path / "factory.db"
+        self._make_v6_db(db)
+        with get_connection(db) as conn:
+            conn.execute(
+                """INSERT INTO tasks
+                   (task_id, project_id, name, status, created_at, metadata)
+                   VALUES ('t1', 'p1', 'keepme', 'pending', 't', '{}')"""
+            )
+            conn.commit()
+
+        initialize_database(db)
+
+        with get_connection(db) as conn:
+            assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]
+            assert {
+                "project_briefs", "research_records", "plans",
+                "plan_approvals",
+            } <= _tables(conn)
+            task = conn.execute(
+                "SELECT name FROM tasks WHERE task_id='t1'"
+            ).fetchone()
+            assert task is not None and task["name"] == "keepme"
+
+    def test_plans_unique_project_version(self, tmp_path: Path) -> None:
+        db = tmp_path / "factory.db"
+        initialize_database(db)
+        with get_connection(db) as conn:
+            conn.execute(
+                """INSERT INTO plans
+                   (plan_id, project_id, version, plan_hash, plan_json,
+                    status, pipeline, profile, created_by, created_at,
+                    updated_at)
+                   VALUES ('plan-a', 'p1', 1, 'h', '{}', 'pending',
+                           'standard', 'balanced', 'x', 't', 't')"""
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO plans
+                       (plan_id, project_id, version, plan_hash, plan_json,
+                        status, pipeline, profile, created_by, created_at,
+                        updated_at)
+                       VALUES ('plan-b', 'p1', 1, 'h', '{}', 'pending',
+                               'standard', 'balanced', 'x', 't', 't')"""
+                )
+            conn.rollback()
+
+    def test_v7_table_columns(self, tmp_path: Path) -> None:
+        db = tmp_path / "factory.db"
+        initialize_database(db)
+        with get_connection(db) as conn:
+            plan_cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(plans)"
+            ).fetchall()}
+            assert {
+                "plan_id", "project_id", "version", "plan_hash",
+                "plan_json", "brief_id", "research_id", "status",
+                "pipeline", "profile", "created_by", "parent_plan_id",
+                "created_at", "updated_at",
+            } <= plan_cols
+            approval_cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(plan_approvals)"
+            ).fetchall()}
+            assert {
+                "approval_id", "plan_id", "plan_hash", "decision",
+                "actor", "note", "decided_at",
+            } <= approval_cols
+            brief_cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(project_briefs)"
+            ).fetchall()}
+            assert {
+                "brief_id", "project_id", "name", "source_kind",
+                "source_reference", "source_sha256", "original_spec",
+                "brief_json", "created_at",
+            } <= brief_cols
 
 
 class TestNonNegotiablePolicy:

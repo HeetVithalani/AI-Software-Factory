@@ -39,7 +39,9 @@ CACHE_DIR: Path = FACTORY_ROOT / "cache"
 BACKUPS_DIR: Path = FACTORY_ROOT / "backups"
 TEMP_DIR: Path = FACTORY_ROOT / "temp"
 MODELS_DIR: Path = FACTORY_ROOT / "models"
-DB_PATH: Path = FACTORY_ROOT / "factory.db"
+DB_PATH: Path = Path(
+    os.environ.get("FACTORY_DB_PATH") or str(FACTORY_ROOT / "factory.db")
+)
 
 # ---------------------------------------------------------------------------
 # Settings dataclasses

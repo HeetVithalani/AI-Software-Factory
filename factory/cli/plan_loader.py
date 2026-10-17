@@ -69,6 +69,97 @@ BUILTIN_AGENT_TYPES: tuple[str, ...] = (
 # DAG loader
 # ---------------------------------------------------------------------------
 
+def dag_from_plan_dict(
+    plan: dict[str, Any], *, source: str = "<plan>"
+) -> TaskDAG:
+    """
+    Build a validated TaskDAG from an in-memory plan dict.
+
+    This is the single source of truth for plan -> DAG conversion; both the
+    file loader and the persisted-plan execution path use it. All metadata
+    the plan carries for execution (acceptance criteria, requirement
+    traceability, repair policy, plan identity) is preserved on the nodes.
+    """
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise ConfigurationError(
+            f"plan at {source} has no 'tasks' list."
+        )
+
+    dag = TaskDAG()
+
+    for raw in tasks:
+        if not isinstance(raw, dict):
+            raise ConfigurationError(
+                f"plan at {source}: task entry is not a dict: {raw!r}"
+            )
+        task_id = str(raw.get("task_id", "")).strip()
+        if not task_id:
+            raise ConfigurationError(
+                f"plan at {source}: task entry missing 'task_id': {raw!r}"
+            )
+        name = str(raw.get("name", task_id))
+        agent_type = str(raw.get("agent_type", "")).strip()
+        # Fail-closed (Phase 2c): any non-empty agent_type must be one of
+        # the registered built-in agent types. Empty stays allowed for
+        # backward compatibility (dispatch reports the missing executor
+        # as before), but a *foreign* type is rejected at load time so it
+        # can never reach agent construction or execution.
+        if agent_type and agent_type not in BUILTIN_AGENT_TYPES:
+            raise ConfigurationError(
+                f"plan at {source}: task {task_id!r} has unknown agent_type "
+                f"{agent_type!r}; only the registered built-in agent "
+                f"types are allowed: {', '.join(BUILTIN_AGENT_TYPES)}"
+            )
+        depends_on = [str(d) for d in raw.get("depends_on", [])]
+        metadata: dict[str, Any] = dict(raw.get("metadata", {}))
+        # Carry first-class plan fields into metadata so agents can find
+        # them without re-reading the raw plan.
+        description = str(raw.get("description", ""))
+        if description:
+            metadata.setdefault("description", description)
+        for key in (
+            "acceptance_criteria",
+            "requirement_ids",
+            "required_tools",
+            "allow_repair",
+            "test_path",
+            "required_checks",
+            "plan_id",
+            "plan_hash",
+            "pipeline",
+            "profile",
+        ):
+            if key in raw and key not in metadata:
+                metadata[key] = raw[key]
+
+        node = TaskNode(
+            task_id=task_id,
+            name=name,
+            agent_type=agent_type,
+            depends_on=depends_on,
+            metadata=metadata,
+        )
+        dag.add(node)
+
+    # Validate: missing dep references + cycle check
+    try:
+        dag.validate()
+    except (ValueError, Exception) as exc:
+        raise ConfigurationError(
+            f"plan at {source} DAG validation failed: {exc}"
+        ) from exc
+
+    task_ids = [n.task_id for n in dag.all_nodes()]
+    logger.info(
+        "Built plan DAG from %s: %d tasks — %s",
+        source,
+        dag.node_count(),
+        task_ids,
+    )
+    return dag
+
+
 def load_dag_from_plan(plan_path: Path) -> tuple[TaskDAG, dict[str, Any]]:
     """
     Load a plan.json file and build a validated TaskDAG.
@@ -100,68 +191,7 @@ def load_dag_from_plan(plan_path: Path) -> tuple[TaskDAG, dict[str, Any]]:
             f"plan.json at {plan_path} is not valid JSON: {exc}"
         ) from exc
 
-    tasks = plan.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
-        raise ConfigurationError(
-            f"plan.json at {plan_path} has no 'tasks' list."
-        )
-
-    dag = TaskDAG()
-
-    for raw in tasks:
-        if not isinstance(raw, dict):
-            raise ConfigurationError(
-                f"plan.json: task entry is not a dict: {raw!r}"
-            )
-        task_id = str(raw.get("task_id", "")).strip()
-        if not task_id:
-            raise ConfigurationError(
-                f"plan.json: task entry missing 'task_id': {raw!r}"
-            )
-        name = str(raw.get("name", task_id))
-        agent_type = str(raw.get("agent_type", "")).strip()
-        # Fail-closed (Phase 2c): any non-empty agent_type must be one of
-        # the registered built-in agent types. Empty stays allowed for
-        # backward compatibility (dispatch reports the missing executor
-        # as before), but a *foreign* type is rejected at load time so it
-        # can never reach agent construction or execution.
-        if agent_type and agent_type not in BUILTIN_AGENT_TYPES:
-            raise ConfigurationError(
-                f"plan.json: task {task_id!r} has unknown agent_type "
-                f"{agent_type!r}; only the registered built-in agent "
-                f"types are allowed: {', '.join(BUILTIN_AGENT_TYPES)}"
-            )
-        depends_on = [str(d) for d in raw.get("depends_on", [])]
-        metadata: dict[str, Any] = dict(raw.get("metadata", {}))
-        # Carry description into metadata so agents can find it
-        description = str(raw.get("description", ""))
-        if description:
-            metadata.setdefault("description", description)
-
-        node = TaskNode(
-            task_id=task_id,
-            name=name,
-            agent_type=agent_type,
-            depends_on=depends_on,
-            metadata=metadata,
-        )
-        dag.add(node)
-
-    # Validate: missing dep references + cycle check
-    try:
-        dag.validate()
-    except (ValueError, Exception) as exc:
-        raise ConfigurationError(
-            f"plan.json DAG validation failed: {exc}"
-        ) from exc
-
-    task_ids = [n.task_id for n in dag.all_nodes()]
-    logger.info(
-        "Loaded plan from %s: %d tasks — %s",
-        plan_path,
-        dag.node_count(),
-        task_ids,
-    )
+    dag = dag_from_plan_dict(plan, source=str(plan_path))
     return dag, plan
 
 

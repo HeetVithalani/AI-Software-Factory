@@ -53,9 +53,12 @@ class ResearchSummary(BaseModel):
     def add_source(self, source: ResearchSource) -> None:
         self.sources.append({
             "source_id": source.source_id,
+            "source_type": source.source_type,
             "name": source.name,
             "reference": source.reference,
             "trust_level": source.trust_level,
+            "accessed_at": source.accessed_at.isoformat(),
+            "metadata": dict(source.metadata),
         })
 
     def add_decision(self, decision: DecisionRecord) -> None:
