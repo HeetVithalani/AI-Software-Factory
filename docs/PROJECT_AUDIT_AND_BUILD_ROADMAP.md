@@ -8,6 +8,16 @@
 
 ---
 
+> **Post-milestone addendum (2026-10-17):** roadmap task 3.3 ("Consume
+> `RecoveryPlan` on boot; reconcile `unresolved_task_ids`") is now implemented
+> in substance via `factory/orchestration/boot.py::prepare_dag_for_execution`
+> (checkpoint verification + durable task rows + explicit human resolution of
+> uncertain tasks) and the `factory recovery status|resolve` commands. The
+> original audit text below is preserved as the historical record. See
+> `docs/FINAL_IMPLEMENTATION_STATUS.md`.
+
+---
+
 ## A. Report Metadata and Executive Summary
 
 ### Metadata

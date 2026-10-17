@@ -10,6 +10,15 @@ testing phase.
 
 ---
 
+> **Milestone addendum (2026-10-17, same branch):** the final approved
+> implementation milestone (RPI plan lifecycle, startup recovery, task-aware
+> context, bounded repair cycles, deterministic final audit, per-run model
+> selection) is complete and verified. See
+> [`FINAL_IMPLEMENTATION_STATUS.md`](FINAL_IMPLEMENTATION_STATUS.md) and
+> [`LOCAL_MODEL_CLI_EVALUATION.md`](LOCAL_MODEL_CLI_EVALUATION.md). The
+> workstream text below remains the historical record for the earlier
+> tranche.
+
 ## Workstream A - Security boundary hardening (COMPLETED)
 
 | Item | Scope | Commit |
