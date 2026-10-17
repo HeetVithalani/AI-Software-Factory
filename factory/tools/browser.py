@@ -190,9 +190,10 @@ class BrowserTool(BaseTool):
                 decision.approval_request.request_id
                 if decision.approval_request else ""
             )
-            return self._fail(
+            return self._fail_approval(
                 f"Fetch requires human approval (request_id={req_id}): {url}",
                 command=f"fetch:{url}",
+                request_id=req_id,
             )
 
         # Execute fetch

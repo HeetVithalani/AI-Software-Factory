@@ -451,10 +451,11 @@ class GitTool(BaseTool):
             self._audit_emit("tool.git.approval_required", {
                 "action": action, "request_id": req_id,
             })
-            return self._fail(
+            return self._fail_approval(
                 f"Git mutation requires human approval: {action} "
                 f"(request_id={req_id})",
                 command=action,
+                request_id=req_id,
             )
         return None  # approved
 

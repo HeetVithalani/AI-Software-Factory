@@ -185,6 +185,54 @@ class BaseAgent(abc.ABC):
             errors=all_errors,
         )
 
+    def _awaiting_approval(
+        self,
+        task: TaskRecord,
+        error: str,
+        *,
+        request_id: str = "",
+    ) -> AgentResult:
+        """
+        Return a result that PAUSES on a human approval (COR-003).
+
+        This is not an ordinary failure: success=False with
+        failure_kind="awaiting_approval" tells the orchestrator to park
+        the task in AWAITING_APPROVAL — no retry budget is consumed and
+        the task is requeued only after the approval is granted AND its
+        operation fingerprint re-verifies.
+        """
+        logger.info(
+            "Agent %s awaiting human approval for task %s (request_id=%s): %s",
+            self.agent_id, task.task_id, request_id, error,
+        )
+        return AgentResult(
+            agent_id=self.agent_id,
+            task_id=task.task_id,
+            project_id=task.project_id or self._project_id,
+            success=False,
+            summary=(
+                f"Agent {self.agent_type} awaiting human approval"
+                + (f" (request_id={request_id})" if request_id else "")
+            ),
+            errors=[error],
+            failure_kind="awaiting_approval",
+            approval_request_id=request_id,
+        )
+
+    def _fail_from_tool(self, task: TaskRecord, tool_result: Any) -> AgentResult:
+        """
+        Convert a failed ToolResult into an AgentResult, preserving the
+        awaiting-approval signal (COR-003) when the tool is paused on a
+        pending human decision.
+        """
+        if getattr(tool_result, "requires_human_approval", False):
+            return self._awaiting_approval(
+                task,
+                tool_result.error or "Tool requires human approval",
+                request_id=getattr(tool_result, "approval_request_id", ""),
+            )
+        return self._fail(task, tool_result.error or "Tool failed")
+
     def _artifact_path(self, filename: str) -> Path:
         """Return the path for an artifact file in the workspace."""
         if self.workspace_root is None:

@@ -521,3 +521,218 @@ class TestDocumentationAgent:
         task = _make_task()
         result = agent.run(task)
         assert not result.success
+
+# ---------------------------------------------------------------------------
+# Approval pause propagation from tools to agent results (COR-003)
+# ---------------------------------------------------------------------------
+
+class TestAgentApprovalPropagation:
+    def _concrete(self, tmp_path):
+        from factory.agents.base import BaseAgent
+
+        class ConcreteAgent(BaseAgent):
+            agent_type = "test"
+
+            def run(self, task):  # pragma: no cover - not under test
+                return self._ok(task)
+
+        return ConcreteAgent(workspace_root=tmp_path)
+
+    def test_fail_from_tool_ordinary_failure(self, tmp_path):
+        from factory.tools.base import ToolResult
+        agent = self._concrete(tmp_path)
+        task = _make_task()
+        res = ToolResult(success=False, error="command failed rc=1")
+        result = agent._fail_from_tool(task, res)
+        assert result.success is False
+        assert result.failure_kind == ""
+        assert result.approval_request_id == ""
+        assert "command failed rc=1" in result.errors[0]
+
+    def test_fail_from_tool_preserves_approval_pause(self, tmp_path):
+        from factory.tools.base import ToolResult
+        agent = self._concrete(tmp_path)
+        task = _make_task()
+        res = ToolResult(
+            success=False,
+            error="blocked pending decision",
+            requires_human_approval=True,
+            approval_request_id="req-9",
+        )
+        result = agent._fail_from_tool(task, res)
+        assert result.success is False
+        assert result.failure_kind == "awaiting_approval"
+        assert result.approval_request_id == "req-9"
+
+    def test_awaiting_approval_result_fields(self, tmp_path):
+        agent = self._concrete(tmp_path)
+        task = _make_task()
+        result = agent._awaiting_approval(
+            task, "needs a human decision", request_id="req-5"
+        )
+        assert result.success is False
+        assert result.failure_kind == "awaiting_approval"
+        assert result.approval_request_id == "req-5"
+        assert "needs a human decision" in result.errors
+        assert "req-5" in result.summary
+
+
+# ---------------------------------------------------------------------------
+# Builder action execution pauses on pending approvals (COR-003)
+# ---------------------------------------------------------------------------
+
+class TestBuilderApprovalPause:
+    @staticmethod
+    def _builder(tmp_path):
+        from factory.agents.builder import BuilderAgent
+        return BuilderAgent(workspace_root=tmp_path)
+
+    @staticmethod
+    def _action(action_type: str, arguments: dict):
+        from unittest.mock import MagicMock
+        action = MagicMock()
+        action.action_type = action_type
+        action.arguments = arguments
+        return action
+
+    @staticmethod
+    def _tool_result(**kwargs):
+        from factory.tools.base import ToolResult
+        return ToolResult(**kwargs)
+
+    def test_shell_run_approval_pauses_agent(self, tmp_path):
+        builder = self._builder(tmp_path)
+        res = self._tool_result(
+            success=False,
+            error="requires human approval (request_id=req-7)",
+            requires_human_approval=True,
+            approval_request_id="req-7",
+        )
+        shell = MagicMock()
+        shell.run.return_value = res
+        fs = MagicMock()
+        action = self._action("shell.run", {"command": "git push origin main"})
+
+        text, stop = builder._execute_action(
+            action, task=_make_task(), fs_tool=fs, shell_tool=shell,
+            written=[], errors=[],
+        )
+
+        assert stop is not None
+        assert stop.success is False
+        assert stop.failure_kind == "awaiting_approval"
+        assert stop.approval_request_id == "req-7"
+        assert text == f"Error: {res.error}"
+        shell.run.assert_called_once()  # stopped immediately, no re-tries
+
+    def test_shell_run_ordinary_failure_does_not_stop(self, tmp_path):
+        builder = self._builder(tmp_path)
+        res = self._tool_result(success=False, error="command failed rc=1")
+        shell = MagicMock()
+        shell.run.return_value = res
+        fs = MagicMock()
+        action = self._action("shell.run", {"command": "ls"})
+
+        text, stop = builder._execute_action(
+            action, task=_make_task(), fs_tool=fs, shell_tool=shell,
+            written=[], errors=[],
+        )
+        assert stop is None
+        assert text == "Error: command failed rc=1"
+
+    def test_shell_run_success_returns_output(self, tmp_path):
+        builder = self._builder(tmp_path)
+        shell = MagicMock()
+        shell.run.return_value = self._tool_result(success=True, output="ok-out")
+        fs = MagicMock()
+        action = self._action("shell.run", {"command": "ls"})
+
+        text, stop = builder._execute_action(
+            action, task=_make_task(), fs_tool=fs, shell_tool=shell,
+            written=[], errors=[],
+        )
+        assert stop is None
+        assert text == "ok-out"
+
+    def test_write_success_tracks_written_files(self, tmp_path):
+        builder = self._builder(tmp_path)
+        fs = MagicMock()
+        fs.write.return_value = self._tool_result(success=True, output="written")
+        shell = MagicMock()
+        written: list[str] = []
+        action = self._action(
+            "filesystem.write", {"path": "src/app.py", "content": "x = 1"}
+        )
+
+        text, stop = builder._execute_action(
+            action, task=_make_task(), fs_tool=fs, shell_tool=shell,
+            written=written, errors=[],
+        )
+        assert stop is None
+        assert written == [str(Path("src/app.py"))]
+        assert text == "written"
+
+    def test_write_failure_appends_errors_and_stops_on_approval(self, tmp_path):
+        builder = self._builder(tmp_path)
+        fs = MagicMock()
+        fs.write.return_value = self._tool_result(
+            success=False,
+            error="Write blocked: requires approval for .env",
+            requires_human_approval=True,
+            approval_request_id="req-3",
+        )
+        shell = MagicMock()
+        written: list[str] = []
+        errors: list[str] = []
+        action = self._action(
+            "filesystem.write", {"path": ".env", "content": "SECRET=1"}
+        )
+
+        text, stop = builder._execute_action(
+            action, task=_make_task(), fs_tool=fs, shell_tool=shell,
+            written=written, errors=errors,
+        )
+        assert stop is not None
+        assert stop.failure_kind == "awaiting_approval"
+        assert stop.approval_request_id == "req-3"
+        assert errors  # failure still recorded for the audit trail
+        assert written == []
+
+    def test_read_failure_does_not_stop_without_approval(self, tmp_path):
+        builder = self._builder(tmp_path)
+        fs = MagicMock()
+        fs.read.return_value = self._tool_result(
+            success=False, error="File not found: x.txt"
+        )
+        shell = MagicMock()
+        action = self._action("filesystem.read", {"path": "x.txt"})
+
+        text, stop = builder._execute_action(
+            action, task=_make_task(), fs_tool=fs, shell_tool=shell,
+            written=[], errors=[],
+        )
+        assert stop is None
+        assert text == "Error: File not found: x.txt"
+
+    def test_unknown_action_type_no_stop(self, tmp_path):
+        builder = self._builder(tmp_path)
+        action = self._action("network.ssh", {"host": "example"})
+        text, stop = builder._execute_action(
+            action, task=_make_task(), fs_tool=MagicMock(),
+            shell_tool=MagicMock(), written=[], errors=[],
+        )
+        assert stop is None
+        assert "Unknown action type" in text
+
+    def test_tool_exception_yields_error_text_without_stop(self, tmp_path):
+        builder = self._builder(tmp_path)
+        shell = MagicMock()
+        shell.run.side_effect = RuntimeError("exploded")
+        action = self._action("shell.run", {"command": "x"})
+
+        text, stop = builder._execute_action(
+            action, task=_make_task(), fs_tool=MagicMock(),
+            shell_tool=shell, written=[], errors=[],
+        )
+        assert stop is None
+        assert "Tool execution failed" in text

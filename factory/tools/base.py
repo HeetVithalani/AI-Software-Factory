@@ -54,6 +54,14 @@ class ToolResult:
         SHA-256 hash of the primary output, for audit trail attachment.
     metadata:
         Supplementary structured data (test results, scan findings, etc.).
+    requires_human_approval:
+        True when the operation did not fail — it is PAUSED pending a
+        human approval decision (COR-003). Consumers must not treat this
+        as an ordinary error.
+    approval_request_id:
+        The pending ApprovalRequest id when requires_human_approval is
+        True — lets agents/orchestrator park and later re-verify the
+        exact approval before resuming.
     produced_at:
         UTC timestamp of result production.
     """
@@ -66,6 +74,8 @@ class ToolResult:
     returncode: int | None = None
     evidence_hash: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    requires_human_approval: bool = False
+    approval_request_id: str = ""
     produced_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -89,6 +99,8 @@ class ToolResult:
             "returncode": self.returncode,
             "evidence_hash": self.evidence_hash,
             "metadata": self.metadata,
+            "requires_human_approval": self.requires_human_approval,
+            "approval_request_id": self.approval_request_id,
             "produced_at": self.produced_at.isoformat(),
         }
 
@@ -292,6 +304,22 @@ class BaseTool:
             tool_name=self.tool_name,
             command=command,
         )
+
+    def _fail_approval(
+        self, error: str, *, command: str = "", request_id: str = ""
+    ) -> ToolResult:
+        """
+        Return a failure that is specifically a PENDING human approval.
+
+        The operation did not go wrong — it is paused for review
+        (COR-003). Agents propagate the flag so the orchestrator parks
+        the task in AWAITING_APPROVAL instead of burning retry budget
+        or marking it failed.
+        """
+        result = self._fail(error, command=command)
+        result.requires_human_approval = True
+        result.approval_request_id = request_id
+        return result
 
     def _ok(
         self,

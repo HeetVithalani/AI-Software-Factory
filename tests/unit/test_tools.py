@@ -664,20 +664,34 @@ class TestGitToolMutations:
         assert result.success or "nothing to commit" in result.output.lower() or result.returncode == 1
 
     def test_commit_requires_approval_with_pending_broker(self, tmp_path):
+        # Contract note: the workspace must BE a git repo (git init) or the
+        # SEC-004 boundary gate refuses first — a bare tmp dir under a parent
+        # repo never reaches the broker. Assertion asserts the approval
+        # PHRASE + structured flag so a boundary message (which embeds the
+        # test's tmp path) can never satisfy it by coincidence.
+        import subprocess
         from factory.tools.git import GitTool
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
         broker = _broker_always_pending()
         tool = GitTool(workspace_root=tmp_path, broker=broker)
         result = tool.commit("test commit")
         assert not result.success
-        assert "approval" in result.error.lower()
+        assert "requires human approval" in result.error
+        assert result.requires_human_approval is True
+        assert result.approval_request_id == "req-abc"
 
     def test_push_denied_by_broker(self, tmp_path):
+        # Same boundary note as above: git init first so the SEC-004 gate
+        # passes and the broker decision is what actually blocks the push.
+        import subprocess
         from factory.tools.git import GitTool
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
         broker = _broker_always_deny()
         tool = GitTool(workspace_root=tmp_path, broker=broker)
         result = tool.push("origin", "main")
         assert not result.success
-        assert "denied" in result.error.lower()
+        assert "denied by policy" in result.error
+        assert result.requires_human_approval is False
 
 
 # ---------------------------------------------------------------------------
@@ -1173,3 +1187,100 @@ class TestBrowserRedirects:
         # Malformed redirect is not followed — the response stands as-is.
         assert len(fake.requested) == 1
         assert result.returncode == 302
+
+
+# ---------------------------------------------------------------------------
+# Approval pause propagation on ToolResult (COR-003)
+# ---------------------------------------------------------------------------
+
+class TestApprovalPropagation:
+    """A pending human decision must be structurally distinguishable from
+    an ordinary failure so agents/orchestrator can pause (not fail)."""
+
+    def test_tool_result_dict_exposes_approval_fields(self):
+        from factory.tools.base import ToolResult
+        r = ToolResult(
+            success=False,
+            error="blocked",
+            requires_human_approval=True,
+            approval_request_id="req-1",
+        )
+        d = r.to_dict()
+        assert d["requires_human_approval"] is True
+        assert d["approval_request_id"] == "req-1"
+
+    def test_tool_result_defaults_are_ordinary_failure(self):
+        from factory.tools.base import ToolResult
+        r = ToolResult(success=False, error="boom")
+        d = r.to_dict()
+        assert d["requires_human_approval"] is False
+        assert d["approval_request_id"] == ""
+
+    def test_shell_pending_approval_flagged(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        broker = _broker_always_pending()
+        tool = ShellTool(workspace_root=tmp_path, broker=broker)
+        result = tool.run("unknowncmd --flag")
+        assert not result.success
+        assert result.requires_human_approval is True
+        assert result.approval_request_id == "req-abc"
+        assert "request_id=req-abc" in result.error
+
+    def test_shell_denied_is_ordinary_failure(self, tmp_path):
+        from factory.tools.shell import ShellTool
+        broker = _broker_always_deny()
+        tool = ShellTool(workspace_root=tmp_path, broker=broker)
+        result = tool.run("curl http://example.com")
+        assert not result.success
+        assert result.requires_human_approval is False
+
+    def test_git_commit_pending_approval_flagged(self, tmp_path):
+        import subprocess
+        from factory.tools.git import GitTool
+        # git init: workspace must be the repo root or the SEC-004
+        # boundary gate refuses before the broker is consulted.
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+        broker = _broker_always_pending()
+        tool = GitTool(workspace_root=tmp_path, broker=broker)
+        result = tool.commit("msg")
+        assert not result.success
+        assert result.requires_human_approval is True
+        assert result.approval_request_id == "req-abc"
+
+    def test_git_denied_is_ordinary_failure(self, tmp_path):
+        import subprocess
+        from factory.tools.git import GitTool
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+        broker = _broker_always_deny()
+        tool = GitTool(workspace_root=tmp_path, broker=broker)
+        result = tool.commit("msg")
+        assert not result.success
+        assert result.requires_human_approval is False
+
+    def test_filesystem_sensitive_write_pending_flagged(self, tmp_path):
+        from factory.tools.filesystem import FilesystemTool
+        broker = _broker_always_pending()
+        tool = FilesystemTool(workspace_root=tmp_path, broker=broker)
+        result = tool.write(Path(".env"), "SECRET=1")
+        assert not result.success
+        assert result.requires_human_approval is True
+        assert result.approval_request_id == "req-abc"
+        assert not (tmp_path / ".env").exists()  # nothing written while paused
+
+    def test_filesystem_denied_is_ordinary_failure(self, tmp_path):
+        from factory.tools.filesystem import FilesystemTool
+        (tmp_path / "todel.txt").write_text("data")
+        broker = _broker_always_deny()
+        tool = FilesystemTool(workspace_root=tmp_path, broker=broker)
+        result = tool.delete(Path("todel.txt"))
+        assert not result.success
+        assert result.requires_human_approval is False
+
+    def test_browser_pending_approval_flagged(self):
+        from factory.tools.browser import BrowserTool
+        broker = _broker_always_pending()
+        tool = BrowserTool(broker=broker)
+        result = tool.fetch("https://docs.python.org/3/")
+        assert not result.success
+        assert result.requires_human_approval is True
+        assert result.approval_request_id == "req-abc"

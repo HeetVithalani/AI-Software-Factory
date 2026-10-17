@@ -290,6 +290,15 @@ class AgentResult(BaseModel):
     # Deterministic evidence produced by the agent (file paths, hashes, etc.)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    # Deterministic failure classification (COR-003/COR-004).
+    # "" for ordinary failures; "awaiting_approval" when the task is
+    # paused on a human approval request; "transient"/"permanent" when
+    # the producer knows the cause. The orchestrator consults this
+    # before applying the bounded-retry policy — never an LLM verdict.
+    failure_kind: str = ""
+    # Set when failure_kind == "awaiting_approval": the DB approval
+    # request id the task is parked on.
+    approval_request_id: str = ""
     produced_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )

@@ -161,36 +161,23 @@ class BuilderAgent(BaseAgent):
             if not proposal.proposed_actions:
                 messages.append({"role": "user", "content": "You didn't set completed=true but proposed no actions. Please propose an action or complete."})
                 continue
-                
+
             # For Phase 2, we just take the first action proposed
             action = proposal.proposed_actions[0]
-            action_result = None
-            
-            try:
-                if action.action_type == "filesystem.write":
-                    path = Path(action.arguments.get("path", ""))
-                    content = action.arguments.get("content", "")
-                    res = fs_tool.write(path, content, task_id=task.task_id)
-                    action_result = res.output if res.success else f"Error: {res.error}"
-                    if res.success:
-                        written.append(str(path))
-                    else:
-                        errors.append(res.error)
-                        
-                elif action.action_type == "filesystem.read":
-                    path = Path(action.arguments.get("path", ""))
-                    res = fs_tool.read(path, task_id=task.task_id)
-                    action_result = res.output if res.success else f"Error: {res.error}"
-                    
-                elif action.action_type == "shell.run":
-                    cmd = action.arguments.get("command", "")
-                    res = shell_tool.run(cmd, task_id=task.task_id)
-                    action_result = res.output if res.success else f"Error: {res.error}"
-                else:
-                    action_result = f"Unknown action type: {action.action_type}"
-            except Exception as e:
-                action_result = f"Tool execution failed: {e}"
-                
+            action_result, stop_result = self._execute_action(
+                action,
+                task=task,
+                fs_tool=fs_tool,
+                shell_tool=shell_tool,
+                written=written,
+                errors=errors,
+            )
+            if stop_result is not None:
+                # A human approval gates this action: pause the task
+                # (COR-003) rather than burning turns or mislabelling it
+                # as an ordinary failure.
+                return stop_result
+
             messages.append({
                 "role": "user",
                 "content": f"Action {action.action_type} executed.\nResult:\n{action_result}"
@@ -219,3 +206,67 @@ class BuilderAgent(BaseAgent):
             },
             evidence=[{"kind": "file", "path": p} for p in written],
         )
+
+    # ------------------------------------------------------------------
+    # Tool action execution
+    # ------------------------------------------------------------------
+
+    def _execute_action(
+        self,
+        action: Any,
+        *,
+        task: TaskRecord,
+        fs_tool: Any,
+        shell_tool: Any,
+        written: list[str],
+        errors: list[str],
+    ) -> tuple[str, AgentResult | None]:
+        """
+        Execute one proposed tool action.
+
+        Returns ``(result_text, stop_result)``. ``stop_result`` is
+        non-None only when execution must PAUSE for a human approval
+        (COR-003) — the caller returns it immediately, the orchestrator
+        parks the task in AWAITING_APPROVAL, and no turn/retry budget is
+        consumed while the approval is pending.
+        """
+        try:
+            if action.action_type == "filesystem.write":
+                path = Path(action.arguments.get("path", ""))
+                content = action.arguments.get("content", "")
+                res = fs_tool.write(path, content, task_id=task.task_id)
+                if res.success:
+                    written.append(str(path))
+                    return res.output, None
+                errors.append(res.error)
+                return f"Error: {res.error}", self._approval_stop(task, res)
+
+            if action.action_type == "filesystem.read":
+                path = Path(action.arguments.get("path", ""))
+                res = fs_tool.read(path, task_id=task.task_id)
+                if res.success:
+                    return res.output, None
+                return f"Error: {res.error}", self._approval_stop(task, res)
+
+            if action.action_type == "shell.run":
+                cmd = action.arguments.get("command", "")
+                res = shell_tool.run(cmd, task_id=task.task_id)
+                if res.success:
+                    return res.output, None
+                return f"Error: {res.error}", self._approval_stop(task, res)
+
+            return f"Unknown action type: {action.action_type}", None
+        except Exception as e:  # noqa: BLE001
+            return f"Tool execution failed: {e}", None
+
+    def _approval_stop(self, task: TaskRecord, res: Any) -> AgentResult | None:
+        """Return an awaiting-approval result when ``res`` is approval-paused."""
+        if not getattr(res, "requires_human_approval", False):
+            return None
+        request_id = getattr(res, "approval_request_id", "")
+        self._emit("agent.builder.awaiting_approval", {
+            "task_id": task.task_id,
+            "approval_request_id": request_id,
+            "error": res.error,
+        })
+        return self._awaiting_approval(task, res.error, request_id=request_id)

@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from factory.errors import (
@@ -33,8 +34,20 @@ from factory.errors import (
     StateError,
     TaskError,
 )
-from factory.models import AgentResult, TaskRecord, TaskStatus, RiskLevel
+from factory.models import (
+    AgentResult,
+    ApprovalStatus,
+    RecoveryStrategy,
+    TaskRecord,
+    TaskStatus,
+    RiskLevel,
+)
 from factory.orchestration.dag import TaskDAG, TaskNode
+from factory.orchestration.retry import (
+    FailureKind,
+    classify_failure,
+    extract_approval_request_id,
+)
 from factory.orchestration.scheduler import Scheduler, ResourceBudget
 from factory.orchestration.state import OrchestratorStatus
 
@@ -54,6 +67,13 @@ class OrchestratorConfig:
     # Resource budget defaults (GB)
     default_task_ram_gb: float = 0.5
     default_task_vram_gb: float = 0.0
+    # Bounded retries (COR-004): how many RETRIES a transient failure
+    # earns per task when the node declares no budget of its own.
+    # Total attempts = default_max_retries + 1 (first attempt + retries).
+    default_max_retries: int = 3
+    # Deterministic backoff applied before requeueing a retried task.
+    # 0.0 by default — pacing already exists via poll_interval_seconds.
+    retry_backoff_seconds: float = 0.0
 
 
 class Orchestrator:
@@ -236,8 +256,42 @@ class Orchestrator:
             self._status = OrchestratorStatus.STOPPED
             return False
 
+        # COR-008: requeue FAILED nodes that still hold declared retry budget
+        # (e.g. marked FAILED by crash recovery or an external caller).
+        self._requeue_recoverable_failures()
+
+        # COR-003: reconcile AWAITING_APPROVAL nodes — requeue when the
+        # approval is granted in the DB and fingerprint re-verified;
+        # terminate when the human explicitly denied it.
+        self._reconcile_awaiting_approvals()
+
         # Dispatch ready tasks up to concurrency limit
-        for node in self.dag.ready_tasks():
+        ready = self.dag.ready_tasks()
+        if not ready:
+            awaiting = [
+                n for n in self.dag.all_nodes()
+                if n.status == TaskStatus.AWAITING_APPROVAL
+            ]
+            if awaiting:
+                # Nothing can proceed until a human decides — exit the
+                # loop honestly instead of spinning to max_steps.
+                self._status = OrchestratorStatus.AWAITING_APPROVAL
+                if self._audit:
+                    self._audit.emit("orchestrator.awaiting_approval", {
+                        "task_ids": [n.task_id for n in awaiting],
+                        "approval_request_ids": [
+                            n.metadata.get("approval_request_id", "")
+                            for n in awaiting
+                        ],
+                    })
+                logger.info(
+                    "Orchestrator awaiting human approval for %d task(s).",
+                    len(awaiting),
+                )
+                return False
+            return True  # pre-existing stall cases keep old spin semantics
+
+        for node in ready:
             ram = node.metadata.get(
                 "required_ram_gb", self.config.default_task_ram_gb
             )
@@ -277,32 +331,332 @@ class Orchestrator:
             # Execute (synchronous in phase 1)
             result = self._dispatch_task(node)
 
-            # Update DAG
-            if result.success:
-                self.dag.update_status(node.task_id, TaskStatus.COMPLETED)
-                self._tasks_completed += 1
-                if self._audit:
-                    self._audit.emit(
-                        "task.completed",
-                        {
-                            "task_id": node.task_id,
-                            "summary": result.summary,
-                        },
-                    )
-            else:
-                self.dag.update_status(node.task_id, TaskStatus.FAILED)
-                if self._audit:
-                    self._audit.emit(
-                        "task.failed",
-                        {
-                            "task_id": node.task_id,
-                            "errors": result.errors,
-                        },
-                    )
+            # Apply the outcome: completed / awaiting-approval / bounded
+            # retry / terminal failure (see _record_result).
+            self._record_result(node, result)
 
             self.scheduler.complete(node.task_id)
 
         return True
+
+    # ------------------------------------------------------------------
+    # Result handling — bounded retries (COR-004) + approval pause (COR-003)
+    # ------------------------------------------------------------------
+
+    def _record_result(self, node: TaskNode, result: AgentResult) -> None:
+        """
+        Apply one dispatch result to the DAG.
+
+        * success → COMPLETED.
+        * awaiting approval → AWAITING_APPROVAL (a pause, not a failure:
+          no retry budget consumed; requeued only after grant +
+          fingerprint re-verification).
+        * transient failure with retry budget → requeued to PENDING with
+          an incremented retry_count (bounded: retry_count < max_retries).
+        * anything else → terminal failure (retry_count >= max_retries,
+          non-retryable/unknown classification, or a non-retry recovery
+          strategy), marked so the DAG classifies it as unrecoverable.
+        """
+        if result.success:
+            self.dag.update_status(node.task_id, TaskStatus.COMPLETED)
+            self._tasks_completed += 1
+            if self._audit:
+                self._audit.emit(
+                    "task.completed",
+                    {
+                        "task_id": node.task_id,
+                        "summary": result.summary,
+                    },
+                )
+            return
+
+        kind = classify_failure(result)
+
+        # ---- Approval pause (COR-003) --------------------------------
+        if kind == FailureKind.AWAITING_APPROVAL:
+            request_id = result.approval_request_id or extract_approval_request_id(
+                "\n".join(result.errors)
+            )
+            node.metadata["approval_request_id"] = request_id
+            node.metadata["awaiting_since"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            self.dag.update_status(node.task_id, TaskStatus.AWAITING_APPROVAL)
+            if self._audit:
+                self._audit.emit("task.awaiting_approval", {
+                    "task_id": node.task_id,
+                    "name": node.name,
+                    "approval_request_id": request_id,
+                    "errors": result.errors,
+                })
+            logger.info(
+                "Task %s paused awaiting approval (request_id=%s).",
+                node.task_id, request_id or "<unbound>",
+            )
+            return
+
+        # ---- Ordinary failure → bounded retry (COR-004) ---------------
+        strategy = str(node.metadata.get("recovery_strategy", "") or "")
+        try:
+            max_retries = int(
+                node.metadata.get(
+                    "max_retries", self.config.default_max_retries
+                )
+            )
+        except (TypeError, ValueError):
+            max_retries = self.config.default_max_retries
+        max_retries = max(0, max_retries)
+        # Declare the budget on the node so DAG-level COR-008
+        # classification sees the same numbers the orchestrator uses.
+        node.metadata["max_retries"] = max_retries
+        retries_used = int(node.metadata.get("retry_count", 0))
+
+        non_retryable_strategy = strategy in {
+            RecoveryStrategy.ESCALATE_HUMAN.value,
+            RecoveryStrategy.SKIP.value,
+        }
+        will_retry = (
+            kind == FailureKind.TRANSIENT
+            and not non_retryable_strategy
+            and retries_used < max_retries
+        )
+
+        if will_retry:
+            attempt = retries_used + 1
+            node.metadata["retry_count"] = attempt
+            backoff = max(0.0, float(self.config.retry_backoff_seconds))
+            if self._audit:
+                self._audit.emit("task.retry", {
+                    "task_id": node.task_id,
+                    "name": node.name,
+                    "attempt": attempt,
+                    "max_retries": max_retries,
+                    "failure_kind": kind.value,
+                    "backoff_seconds": backoff,
+                    "errors": result.errors,
+                })
+            logger.warning(
+                "Task %s failed (%s) — retry %d/%d scheduled.",
+                node.task_id, kind.value, attempt, max_retries,
+            )
+            if backoff:
+                time.sleep(backoff)
+            self.dag.update_status(node.task_id, TaskStatus.PENDING)
+            return
+
+        # ---- Terminal outcomes ---------------------------------------
+        if strategy == RecoveryStrategy.SKIP.value:
+            node.metadata["terminal_failure"] = True
+            self.dag.update_status(node.task_id, TaskStatus.SKIPPED)
+            if self._audit:
+                self._audit.emit("task.skipped", {
+                    "task_id": node.task_id,
+                    "recovery_strategy": strategy,
+                    "errors": result.errors,
+                })
+            logger.warning(
+                "Task %s skipped (recovery_strategy=skip).", node.task_id
+            )
+            return
+
+        node.metadata["terminal_failure"] = True
+        if strategy == RecoveryStrategy.ESCALATE_HUMAN.value:
+            if self._audit:
+                self._audit.emit("task.escalated", {
+                    "task_id": node.task_id,
+                    "recovery_strategy": strategy,
+                    "errors": result.errors,
+                })
+            logger.warning(
+                "Task %s escalated to a human "
+                "(recovery_strategy=escalate_human).",
+                node.task_id,
+            )
+
+        self.dag.update_status(node.task_id, TaskStatus.FAILED)
+        if self._audit:
+            self._audit.emit(
+                "task.failed",
+                {
+                    "task_id": node.task_id,
+                    "errors": result.errors,
+                    "failure_kind": kind.value,
+                    "retries_used": retries_used,
+                    "max_retries": max_retries,
+                    "retry_exhausted": retries_used >= max_retries,
+                },
+            )
+
+    # ------------------------------------------------------------------
+    # Requeue passes (COR-008 / COR-003)
+    # ------------------------------------------------------------------
+
+    def _requeue_recoverable_failures(self) -> None:
+        """
+        Requeue FAILED nodes whose declared retry budget remains (COR-008).
+
+        Typically produced by crash recovery or an external caller: a
+        failure mark with retries left is not final. Bounded — each
+        re-dispatch either succeeds, consumes budget, or terminates with
+        a terminal marker.
+        """
+        for node in self.dag.all_nodes():
+            if (
+                node.status == TaskStatus.FAILED
+                and self.dag.is_failure_recoverable(node.task_id)
+            ):
+                self.dag.update_status(node.task_id, TaskStatus.PENDING)
+                if self._audit:
+                    self._audit.emit("task.retry_requeued", {
+                        "task_id": node.task_id,
+                        "retry_count": node.metadata.get("retry_count", 0),
+                        "max_retries": node.metadata.get("max_retries", 0),
+                        "reason": "failed node retains declared retry budget",
+                    })
+                logger.info(
+                    "Task %s requeued: retry budget remains (%s/%s used).",
+                    node.task_id,
+                    node.metadata.get("retry_count", 0),
+                    node.metadata.get("max_retries", 0),
+                )
+
+    def _reconcile_awaiting_approvals(self) -> None:
+        """
+        Reconcile AWAITING_APPROVAL tasks against their DB decisions (COR-003).
+
+        * ``approved`` AND fingerprint re-verified → requeue to PENDING.
+        * ``denied`` → terminal failure: the human decided against the
+          operation, so the parked task ends (audit records the denial).
+        * pending / lookup problems / unverifiable rows → stay parked
+          (fail-closed: nothing resumes without a verified grant).
+        * no recorded request id at all → terminal failure: nothing can
+          ever resolve this state, so parking it forever would be a lie.
+
+        Requeue happens ONLY when, in the DB:
+
+        1. the request exists and its status is ``approved``, and
+        2. the stored operation fingerprint is present AND re-verifies
+           against a fresh recomputation from the request's own material
+           fields — legacy/unbound (NULL) fingerprints and tampered rows
+           never resume (fail-closed).
+
+        The permission broker then re-checks the EXACT operation again
+        during re-execution (operation-bound approvals, SEC-006): if the
+        task attempts a materially different operation it lands in a fresh
+        approval request instead of riding this grant.
+        """
+        for node in self.dag.all_nodes():
+            if node.status != TaskStatus.AWAITING_APPROVAL:
+                continue
+            request_id = str(node.metadata.get("approval_request_id", "") or "")
+            if not request_id:
+                # Unresolvable state — no id can ever be verified.
+                node.metadata["terminal_failure"] = True
+                self.dag.update_status(node.task_id, TaskStatus.FAILED)
+                if self._audit:
+                    self._audit.emit("task.awaiting_unresolvable", {
+                        "task_id": node.task_id,
+                        "reason": "awaiting state has no approval_request_id",
+                    })
+                logger.error(
+                    "Task %s awaited an approval with no request id — "
+                    "marked failed (nothing could ever resume it).",
+                    node.task_id,
+                )
+                continue
+
+            state = self._approval_state(request_id)
+
+            if state == "denied":
+                node.metadata["terminal_failure"] = True
+                self.dag.update_status(node.task_id, TaskStatus.FAILED)
+                if self._audit:
+                    self._audit.emit("task.approval_denied", {
+                        "task_id": node.task_id,
+                        "approval_request_id": request_id,
+                    })
+                logger.warning(
+                    "Task %s terminated: approval %s was DENIED.",
+                    node.task_id, request_id,
+                )
+                continue
+
+            if state != "approved":
+                continue  # pending / missing / unverifiable → stay parked
+
+            node.metadata["approval_requeued_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            self.dag.update_status(node.task_id, TaskStatus.PENDING)
+            if self._audit:
+                self._audit.emit("task.approval_granted_requeued", {
+                    "task_id": node.task_id,
+                    "approval_request_id": request_id,
+                })
+            logger.info(
+                "Task %s requeued after approval %s (fingerprint re-verified).",
+                node.task_id, request_id,
+            )
+
+    def _approval_state(self, request_id: str) -> str:
+        """
+        Look up an approval decision in the DB with fail-closed semantics.
+
+        Returns ``"approved"`` / ``"denied"`` / ``"pending"`` /
+        ``"missing"`` (row absent) / ``"unverified"`` (lookup failed, a
+        legacy row, or a fingerprint that does not re-verify).
+
+        Only ``"approved"`` is ever sufficient to resume: the stored
+        operation fingerprint must be present AND match a fresh
+        recomputation from the request's own material fields — legacy
+        NULL/unbound approvals and tampered/stale rows never clear.
+        """
+        broker = self._permission_broker
+        if broker is None:
+            return "unverified"
+        mgr = getattr(broker, "approval_manager", None)
+        if mgr is None:
+            return "unverified"
+        try:
+            request = mgr.get_request(request_id)
+        except Exception as exc:  # noqa: BLE001 — resume must fail closed
+            logger.debug("Approval lookup failed for %s: %s", request_id, exc)
+            return "unverified"
+        if request is None:
+            return "missing"
+
+        status = (
+            request.status.value
+            if isinstance(request.status, ApprovalStatus)
+            else str(request.status)
+        )
+        if status == ApprovalStatus.DENIED.value:
+            return "denied"
+        if status != ApprovalStatus.APPROVED.value:
+            return "pending"
+
+        if not request.operation_fingerprint:
+            logger.warning(
+                "Approval %s has no operation fingerprint (legacy/unbound) "
+                "— not resuming.",
+                request_id,
+            )
+            return "unverified"
+
+        from factory.permissions.approvals import make_operation_fingerprint
+        recomputed = make_operation_fingerprint(
+            request.action_category or request.action,
+            request.target,
+            request.action,
+        )
+        if recomputed != request.operation_fingerprint:
+            logger.warning(
+                "Approval %s failed fingerprint re-verification — "
+                "not resuming.",
+                request_id,
+            )
+            return "unverified"
+        return "approved"
 
     def run(self, max_steps: int = 10_000) -> OrchestratorStatus:
         """
@@ -353,5 +707,6 @@ class Orchestrator:
                 "failed": len(self.dag.failed_ids()),
                 "pending": len(self.dag.pending_ids()),
                 "ready": len(self.dag.ready_tasks()),
+                "awaiting_approval": len(self.dag.awaiting_approval_ids()),
             },
         }

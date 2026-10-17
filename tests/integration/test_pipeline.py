@@ -191,6 +191,42 @@ class TestApprovalsCLI:
         rows = _query_approvals(status_filter="approved")
         assert len(rows) == 0  # nothing auto-granted
 
+    def test_list_output_is_pure_ascii(self, isolated_db, capsys):
+        """CLI output must never raise UnicodeEncodeError on cp1252 pipes."""
+        import argparse
+        self._insert_pending(isolated_db)
+        args = argparse.Namespace(status="pending", project=None)
+        rc = cmd_approvals_list(args)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "req-1" in out
+        assert all(ord(ch) < 128 for ch in out), "approvals list must be ASCII"
+
+    def test_grant_output_ascii_and_honest_resume(self, isolated_db, capsys):
+        import argparse
+        self._insert_pending(isolated_db)
+        args = argparse.Namespace(request_id="req-1", note="reviewed")
+        rc = cmd_approvals_grant(args)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "GRANTED" in out
+        assert all(ord(ch) < 128 for ch in out)
+        # Honest messaging: resume requires a re-run and discloses that
+        # status + operation fingerprint are re-verified first.
+        assert "factory run" in out
+        assert "re-verified" in out
+
+    def test_deny_output_ascii_and_honest(self, isolated_db, capsys):
+        import argparse
+        self._insert_pending(isolated_db)
+        args = argparse.Namespace(request_id="req-1", note="too risky")
+        rc = cmd_approvals_deny(args)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "DENIED" in out
+        assert all(ord(ch) < 128 for ch in out)
+        assert "FRESH" in out  # denial does not silently resume anything
+
 
 # ---------------------------------------------------------------------------
 # Phase 3: OpenCode provider registration (mocked)

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Iterator
 
 from factory.errors import TaskCycleError
-from factory.models import TaskStatus
+from factory.models import RecoveryStrategy, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -132,24 +132,81 @@ class TaskDAG:
             if n.status == TaskStatus.PENDING
         }
 
+    def awaiting_approval_ids(self) -> set[str]:
+        return {
+            nid for nid, n in self._nodes.items()
+            if n.status == TaskStatus.AWAITING_APPROVAL
+        }
+
     def is_complete(self) -> bool:
         """True when all nodes are in a terminal state."""
         return all(n.is_terminal() for n in self._nodes.values())
 
     def has_unrecoverable_failure(self) -> bool:
         """
-        True when a FAILED node blocks one or more PENDING nodes and there
-        is no alternative path to completion.
+        True when a blocked PENDING node can never run (COR-008).
+
+        Retry-aware classification:
+
+        * A pending node with a FAILED dependency is blocked. The
+          failure is *unrecoverable* only when at least one of its
+          failed dependencies is TERMINAL — retries exhausted
+          (``retry_count >= max_retries``), an explicit
+          ``terminal_failure`` marker, escalation to a human, or a
+          failure with no declared retry budget at all (a bare
+          ``update_status(FAILED)`` — undeclared budget is treated as
+          zero retries, preserving the historical behaviour).
+        * A failed dependency that still holds retry budget is NOT yet
+          unrecoverable: the orchestrator requeues it (COR-008) and it
+          may still succeed.
+        * A PENDING node depending on a SKIPPED node is blocked forever
+          (SKIPPED is terminal but never completes) — surfaced as
+          unrecoverable instead of stalling silently.
         """
         failed = self.failed_ids()
-        if not failed:
-            return False
-        # Any pending task that depends on a failed task is blocked
+        skipped = {
+            nid for nid, n in self._nodes.items()
+            if n.status == TaskStatus.SKIPPED
+        }
         for node in self._nodes.values():
-            if node.status == TaskStatus.PENDING:
-                if any(dep in failed for dep in node.depends_on):
-                    return True
+            if node.status != TaskStatus.PENDING:
+                continue
+            failed_deps = [dep for dep in node.depends_on if dep in failed]
+            if failed_deps and any(
+                not self.is_failure_recoverable(dep) for dep in failed_deps
+            ):
+                return True
+            if any(dep in skipped for dep in node.depends_on):
+                return True
         return False
+
+    def is_failure_recoverable(self, task_id: str) -> bool:
+        """
+        True when the node is FAILED but may still succeed (COR-008).
+
+        Recoverable only when ALL of the following hold:
+
+        * no explicit ``terminal_failure`` marker was set,
+        * a declared retry budget remains (``retry_count <
+          max_retries``). An undeclared budget defaults to ZERO — a bare
+          failure mark with no retry metadata is terminal, as before,
+        * the recovery strategy is not ``escalate_human`` (a human must
+          act; automation must not spin on it).
+        """
+        node = self._nodes.get(task_id)
+        if node is None or node.status != TaskStatus.FAILED:
+            return False
+        if node.metadata.get("terminal_failure"):
+            return False
+        strategy = str(node.metadata.get("recovery_strategy", "") or "")
+        if strategy == RecoveryStrategy.ESCALATE_HUMAN.value:
+            return False
+        try:
+            used = int(node.metadata.get("retry_count", 0))
+            budget = int(node.metadata.get("max_retries", 0))
+        except (TypeError, ValueError):
+            return False  # malformed metadata → fail-closed, terminal
+        return used < budget
 
     def ready_tasks(self) -> list[TaskNode]:
         """

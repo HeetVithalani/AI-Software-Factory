@@ -104,11 +104,20 @@ class FilesystemTool(BaseTool):
                 task_id=task_id,
             )
             if decision is not None and not decision.approved:
-                return self._fail(
+                message = (
                     f"Read blocked: sensitive file requires approval "
-                    f"({safe_path.name})",
-                    command=f"read:{path}",
+                    f"({safe_path.name})"
                 )
+                if decision.requires_approval:
+                    # PENDING human decision — paused, not failed (COR-003)
+                    req_id = (
+                        decision.approval_request.request_id
+                        if decision.approval_request else ""
+                    )
+                    return self._fail_approval(
+                        message, command=f"read:{path}", request_id=req_id
+                    )
+                return self._fail(message, command=f"read:{path}")
 
         # Size guard
         size = safe_path.stat().st_size
@@ -190,10 +199,19 @@ class FilesystemTool(BaseTool):
                 task_id=task_id,
             )
             if decision is not None and not decision.approved:
-                return self._fail(
-                    f"Write blocked: requires approval for {safe_path.name}",
-                    command=f"write:{path}",
+                message = (
+                    f"Write blocked: requires approval for {safe_path.name}"
                 )
+                if decision.requires_approval:
+                    # PENDING human decision — paused, not failed (COR-003)
+                    req_id = (
+                        decision.approval_request.request_id
+                        if decision.approval_request else ""
+                    )
+                    return self._fail_approval(
+                        message, command=f"write:{path}", request_id=req_id
+                    )
+                return self._fail(message, command=f"write:{path}")
 
         try:
             if mkdir:
@@ -259,10 +277,17 @@ class FilesystemTool(BaseTool):
             task_id=task_id,
         )
         if decision is not None and not decision.approved:
-            return self._fail(
-                f"Delete blocked: requires approval for {safe_path.name}",
-                command=f"delete:{path}",
-            )
+            message = f"Delete blocked: requires approval for {safe_path.name}"
+            if decision.requires_approval:
+                # PENDING human decision — paused, not failed (COR-003)
+                req_id = (
+                    decision.approval_request.request_id
+                    if decision.approval_request else ""
+                )
+                return self._fail_approval(
+                    message, command=f"delete:{path}", request_id=req_id
+                )
+            return self._fail(message, command=f"delete:{path}")
 
         try:
             if safe_path.is_dir():

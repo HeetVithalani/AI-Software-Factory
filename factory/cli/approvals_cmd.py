@@ -56,9 +56,9 @@ def _fmt_row(row: dict[str, Any]) -> str:
         f"  Effect:      {row.get('expected_effect', '')}",
         f"  Consequence: {row.get('deny_consequence', '')}",
         f"  Requested:   {row.get('requested_at', '')}",
-        f"  Decided at:  {row.get('decided_at') or '—'}",
-        f"  Decided by:  {row.get('decided_by') or '—'}",
-        f"  Note:        {row.get('decision_note') or '—'}",
+        f"  Decided at:  {row.get('decided_at') or '-'}",
+        f"  Decided by:  {row.get('decided_by') or '-'}",
+        f"  Note:        {row.get('decision_note') or '-'}",
     ]
     return "\n".join(lines)
 
@@ -145,12 +145,12 @@ def cmd_approvals_list(args: argparse.Namespace) -> int:
         print(f"No {label} approval requests found.")
         return 0
 
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
     print(f"  APPROVAL REQUESTS ({len(rows)} found)")
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
     for row in rows:
         print(_fmt_row(row))
-        print(f"{'─' * 60}")
+        print(f"{'-' * 60}")
     return 0
 
 
@@ -182,11 +182,14 @@ def cmd_approvals_grant(args: argparse.Namespace) -> int:
     updated = _write_decision(args.request_id, "approved", "human-cli", note)
     if updated:
         print(
-            f"✓ Approval {args.request_id} GRANTED.\n"
+            f"Approval {args.request_id} GRANTED.\n"
             f"  Action:   {row.get('action_category', 'N/A')}\n"
             f"  Target:   {row.get('target', 'N/A')}\n"
-            f"  Note:     {note or '(none)'}\n\n"
-            "  Re-run the failed task to continue."
+            f"  Note:     {note or '(none)'}\n"
+            f"  Resume:   re-run 'factory run' to requeue tasks parked on\n"
+            f"            this approval. Nothing resumes automatically:\n"
+            f"            status AND operation fingerprint are re-verified\n"
+            f"            in the DB before any task is requeued."
         )
         return 0
     else:
@@ -216,10 +219,13 @@ def cmd_approvals_deny(args: argparse.Namespace) -> int:
     updated = _write_decision(args.request_id, "denied", "human-cli", note)
     if updated:
         print(
-            f"✗ Approval {args.request_id} DENIED.\n"
+            f"Approval {args.request_id} DENIED.\n"
             f"  Action:   {row.get('action_category', 'N/A')}\n"
             f"  Target:   {row.get('target', 'N/A')}\n"
-            f"  Note:     {note or '(none)'}"
+            f"  Note:     {note or '(none)'}\n"
+            f"  Resume:   tasks parked on this approval stay parked; a\n"
+            f"            later run will request a FRESH approval for any\n"
+            f"            retry of this operation."
         )
         return 0
     else:

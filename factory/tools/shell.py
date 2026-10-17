@@ -294,18 +294,21 @@ class ShellTool(BaseTool):
                 )
 
             if decision is not None and decision.requires_approval:
+                req_id = (
+                    decision.approval_request.request_id
+                    if decision.approval_request else ""
+                )
                 self._audit_emit("tool.shell.approval_required", {
                     "command": canonical,
                     "risk": risk_level.value,
-                    "request_id": (
-                        decision.approval_request.request_id
-                        if decision.approval_request else ""
-                    ),
+                    "request_id": req_id,
                 })
-                return self._fail(
+                return self._fail_approval(
                     f"Shell command requires human approval "
-                    f"(risk={risk_level.value}): {canonical}",
+                    f"(risk={risk_level.value}, request_id={req_id}): "
+                    f"{canonical}",
                     command=canonical,
+                    request_id=req_id,
                 )
 
         # Resolve the executable to an absolute path (post-approval)

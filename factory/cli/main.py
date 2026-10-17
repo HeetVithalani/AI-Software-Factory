@@ -144,6 +144,11 @@ def run_project(project_path: str, task_desc: str, plan_arg: str | None) -> int:
     # ------------------------------------------------------------------
     status = orch.run()
     print(f"Run completed with status: {status.value}")
+    if status.value == "awaiting_approval":
+        print(
+            "Run paused: task(s) await a human approval decision "
+            "(not a failure — no retry budget was consumed)."
+        )
 
     # ------------------------------------------------------------------
     # 6. Approval gate notice
@@ -159,13 +164,15 @@ def run_project(project_path: str, task_desc: str, plan_arg: str | None) -> int:
                 "ORDER BY requested_at DESC LIMIT 10"
             ).fetchall()
         if pending:
-            print("\n⚠  APPROVAL REQUIRED — tasks are blocked pending human review.")
+            print("\nAPPROVAL REQUIRED - tasks are blocked pending human review.")
             print("   Run the following to resolve:")
             for req_id, category, target in pending:
                 print(f"     factory approvals show {req_id}")
                 print(f"     factory approvals grant {req_id}  # or deny")
             print(
-                "\n   After granting, re-run 'factory run' to continue.\n"
+                "\n   After granting, re-run 'factory run' to requeue the "
+                "parked tasks (status and operation fingerprint are "
+                "re-verified first).\n"
             )
     except Exception:
         pass  # Best-effort; do not crash the run summary
