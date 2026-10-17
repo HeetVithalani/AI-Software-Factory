@@ -59,6 +59,8 @@ class ContextBuilder:
         project_id: str | None = None,
         response_schema: Any | None = None,
         agent_id: str | None = None,
+        context_block: str | None = None,
+        included_files: list[str] | None = None,
         **kwargs: Any,
     ) -> LLMRequest:
         # Resolve response_schema alias if provided by specialist agents
@@ -109,6 +111,15 @@ class ContextBuilder:
                         if system_prompt else selection.block
                     )
 
+        # Task-aware workspace context (deterministic, bounded, read-only).
+        # Appended after the system prompt so task instructions and policy
+        # always come first; reference material can never precede them.
+        if context_block:
+            system_prompt = (
+                f"{system_prompt}\n\n{context_block}" if system_prompt
+                else context_block
+            )
+
         # We could enrich messages here with memory or file content,
         # but the caller (the agent) is responsible for requesting specific files.
         # This builder ensures the total size doesn't exceed bounds.
@@ -126,7 +137,9 @@ class ContextBuilder:
             created_at=datetime.now(timezone.utc),
             system_prompt=system_prompt,
             messages=messages,
-            included_files=[],  # The agent should explicitly state what it included in its request
+            # Deterministic record of exactly which workspace files were
+            # injected (empty when the caller supplied none).
+            included_files=list(included_files or []),
             token_estimate=total_tokens,
         )
         

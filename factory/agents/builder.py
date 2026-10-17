@@ -60,6 +60,28 @@ class BuilderAgent(BaseAgent):
                 "content": f"Task: {task.name}\nDescription: {task.description}\nStart working.",
             }
         ]
+
+        # Task-aware workspace context: deterministic, bounded, read-only
+        # excerpts of existing files. Collected once per task so every turn
+        # sees the same reference material.
+        context_block = ""
+        included_files: list[str] = []
+        if self.workspace_root is not None:
+            try:
+                from factory.context.collector import collect_for_task
+                task_context = collect_for_task(self.workspace_root, task)
+                context_block = task_context.render()
+                included_files = task_context.included_paths
+            except Exception as exc:  # noqa: BLE001 — context is an aid, never a blocker
+                logger.warning(
+                    "Context collection failed for task %s: %s",
+                    task.task_id, exc,
+                )
+            if included_files:
+                self._emit("agent.builder.context_collected", {
+                    "task_id": task.task_id,
+                    "files": included_files,
+                })
         
         max_turns = 15
         turns = 0
@@ -80,6 +102,8 @@ class BuilderAgent(BaseAgent):
                 output_schema=BuilderProposal.model_json_schema(),
                 project_id=task.project_id,
                 agent_id=self.agent_type,
+                context_block=context_block or None,
+                included_files=included_files,
             )
             
             # 2. Execute LLM Call with Retries
@@ -140,6 +164,8 @@ class BuilderAgent(BaseAgent):
                         messages=messages,
                         output_schema=BuilderProposal.model_json_schema(),
                         agent_id=self.agent_type,
+                        context_block=context_block or None,
+                        included_files=included_files,
                     )
 
                 attempt += 1
