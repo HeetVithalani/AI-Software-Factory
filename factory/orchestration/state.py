@@ -18,3 +18,4 @@ class OrchestratorStatus(str, Enum):
     EMERGENCY_STOP = "emergency_stop"
     RECOVERING = "recovering"
     AWAITING_APPROVAL = "awaiting_approval"
+    RECOVERY_REQUIRED = "recovery_required"

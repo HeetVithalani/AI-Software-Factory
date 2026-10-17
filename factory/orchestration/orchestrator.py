@@ -26,6 +26,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from factory.errors import (
@@ -97,6 +98,11 @@ class Orchestrator:
         audit_logger: Any = None,
         permission_broker: Any = None,
         budget: ResourceBudget | None = None,
+        project_id: str = "",
+        plan_id: str = "",
+        plan_hash: str = "",
+        task_store: Any = None,
+        workspace_root: Path | None = None,
     ) -> None:
         self.dag = dag
         self.config = config or OrchestratorConfig()
@@ -104,6 +110,14 @@ class Orchestrator:
         self._recovery_manager = recovery_manager
         self._audit = audit_logger
         self._permission_broker = permission_broker
+        # Runtime identity + persistence (Phase E implementation).
+        self._project_id = project_id
+        self._plan_id = plan_id
+        self._plan_hash = plan_hash
+        self._task_store = task_store
+        self._workspace_root = (
+            Path(workspace_root).resolve() if workspace_root else None
+        )
 
         self.scheduler = Scheduler(
             max_concurrent=self.config.max_concurrent,
@@ -115,6 +129,124 @@ class Orchestrator:
         self._paused: bool = False
         self._executors: dict[str, AgentExecutor] = {}
         self._tasks_completed: int = 0
+
+    # ------------------------------------------------------------------
+    # Persistence helpers (no-ops when no project/task store is bound)
+    # ------------------------------------------------------------------
+
+    def _seed_tasks(self) -> None:
+        if self._task_store is None or not self._project_id:
+            return
+        for node in self.dag.all_nodes():
+            self._task_store.seed_node(
+                self._project_id,
+                node,
+                plan_id=self._plan_id,
+                plan_hash=self._plan_hash,
+            )
+
+    def _persist_node(self, node: TaskNode, result: AgentResult | None = None) -> None:
+        if self._task_store is None or not self._project_id:
+            return
+        error: str | None = None
+        summary: str | None = None
+        if result is not None:
+            summary = result.summary or None
+            if not result.success:
+                error = "\n".join(result.errors) or "task failed"
+        self._task_store.upsert_node(
+            self._project_id, node, error=error, result_summary=summary
+        )
+
+    def _resolve_evidence_path(self, raw_path: str) -> Path | None:
+        if not raw_path:
+            return None
+        candidate = Path(raw_path)
+        if not candidate.is_absolute() and self._workspace_root:
+            candidate = self._workspace_root / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return None
+        if self._workspace_root is not None:
+            try:
+                resolved.relative_to(self._workspace_root)
+            except ValueError:
+                logger.warning(
+                    "Evidence path %r escapes the workspace; not recorded.",
+                    raw_path,
+                )
+                return None
+        return resolved
+
+    def _persist_result_evidence(
+        self, node: TaskNode, result: AgentResult
+    ) -> None:
+        """Hash and record every evidence artifact the agent declared."""
+        if self._task_store is None or not self._project_id:
+            return
+        for item in result.evidence or []:
+            if not isinstance(item, dict):
+                continue
+            resolved = self._resolve_evidence_path(str(item.get("path", "")))
+            if resolved is None or not resolved.is_file():
+                continue
+            from factory.audit.evidence import attach_file_evidence
+            try:
+                attach_file_evidence(
+                    resolved,
+                    project_id=self._project_id,
+                    task_id=node.task_id,
+                    agent_id=node.agent_type,
+                    metadata={"kind": str(item.get("kind", "file"))},
+                    db_path=self._task_store.db_path,
+                )
+            except Exception:  # noqa: BLE001 — evidence loss is surfaced later
+                logger.exception(
+                    "Failed to attach evidence %s for task %s",
+                    resolved, node.task_id,
+                )
+
+    def _checkpoint_state(self, node: TaskNode | None) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "project_id": self._project_id,
+            "plan_id": self._plan_id,
+            "plan_hash": self._plan_hash,
+            "task_statuses": {
+                n.task_id: (
+                    n.status.value
+                    if isinstance(n.status, TaskStatus)
+                    else str(n.status)
+                )
+                for n in self.dag.all_nodes()
+            },
+            "completed_task_ids": sorted(self.dag.completed_ids()),
+            "last_task_id": node.task_id if node is not None else "",
+        }
+
+    def _save_checkpoint(
+        self, node: TaskNode | None = None, result: AgentResult | None = None
+    ) -> None:
+        if self._recovery_manager is None or not self._project_id:
+            return
+        paths: list[Path] = []
+        if result is not None:
+            for item in result.evidence or []:
+                if not isinstance(item, dict):
+                    continue
+                resolved = self._resolve_evidence_path(str(item.get("path", "")))
+                if resolved is not None and resolved.is_file():
+                    paths.append(resolved)
+        try:
+            self._recovery_manager.save_checkpoint(
+                self._checkpoint_state(node),
+                project_id=self._project_id,
+                task_id=node.task_id if node is not None else None,
+                workspace_paths=paths or None,
+            )
+        except Exception:  # noqa: BLE001 — checkpoint loss must be visible
+            logger.exception("Failed to save recovery checkpoint.")
 
     # ------------------------------------------------------------------
     # Registration
@@ -210,7 +342,7 @@ class Orchestrator:
         # Build a TaskRecord for the executor
         record = TaskRecord(
             task_id=node.task_id,
-            project_id="",  # orchestrator doesn't track project_id here
+            project_id=self._project_id,
             name=node.name,
             agent_type=node.agent_type,
             description=node.metadata.get("description", ""),
@@ -328,12 +460,20 @@ class Orchestrator:
                     {"task_id": node.task_id, "name": node.name},
                 )
 
+            # Durable state: task is RUNNING before the side effect starts.
+            self._persist_node(node)
+
             # Execute (synchronous in phase 1)
             result = self._dispatch_task(node)
 
             # Apply the outcome: completed / awaiting-approval / bounded
             # retry / terminal failure (see _record_result).
             self._record_result(node, result)
+
+            # Record outcome, deterministic evidence, and a checkpoint.
+            self._persist_node(node, result)
+            self._persist_result_evidence(node, result)
+            self._save_checkpoint(node, result)
 
             self.scheduler.complete(node.task_id)
 
@@ -506,6 +646,7 @@ class Orchestrator:
                 and self.dag.is_failure_recoverable(node.task_id)
             ):
                 self.dag.update_status(node.task_id, TaskStatus.PENDING)
+                self._persist_node(node)
                 if self._audit:
                     self._audit.emit("task.retry_requeued", {
                         "task_id": node.task_id,
@@ -553,6 +694,7 @@ class Orchestrator:
                 # Unresolvable state — no id can ever be verified.
                 node.metadata["terminal_failure"] = True
                 self.dag.update_status(node.task_id, TaskStatus.FAILED)
+                self._persist_node(node)
                 if self._audit:
                     self._audit.emit("task.awaiting_unresolvable", {
                         "task_id": node.task_id,
@@ -570,6 +712,7 @@ class Orchestrator:
             if state == "denied":
                 node.metadata["terminal_failure"] = True
                 self.dag.update_status(node.task_id, TaskStatus.FAILED)
+                self._persist_node(node)
                 if self._audit:
                     self._audit.emit("task.approval_denied", {
                         "task_id": node.task_id,
@@ -588,6 +731,7 @@ class Orchestrator:
                 timezone.utc
             ).isoformat()
             self.dag.update_status(node.task_id, TaskStatus.PENDING)
+            self._persist_node(node)
             if self._audit:
                 self._audit.emit("task.approval_granted_requeued", {
                     "task_id": node.task_id,
@@ -664,6 +808,8 @@ class Orchestrator:
 
         Returns the final OrchestratorStatus.
         """
+        self._seed_tasks()
+        self._save_checkpoint()
         self._status = OrchestratorStatus.RUNNING
         if self._audit:
             self._audit.emit("orchestrator.started", {})
@@ -679,6 +825,13 @@ class Orchestrator:
             logger.exception("Orchestrator loop error: %s", exc)
             self._status = OrchestratorStatus.STOPPED
 
+        # Final durable snapshot so a restart reconstructs the true state.
+        for node in self.dag.all_nodes():
+            try:
+                self._persist_node(node)
+            except Exception:  # noqa: BLE001
+                logger.exception("Final persist failed for %s", node.task_id)
+        self._save_checkpoint()
         if self._audit:
             self._audit.emit(
                 "orchestrator.stopped",
