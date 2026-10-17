@@ -9,6 +9,12 @@ Security model
   automatically without broker interaction.
 * Mutation operations (commit, push, merge, rebase, reset, apply) are HIGH
   or CRITICAL risk and ALWAYS require explicit PermissionBroker approval.
+* Mutations additionally require that ``workspace_root`` IS the
+  repository root — acting on a PARENT repository from a subdirectory
+  crosses the workspace boundary and is refused (SEC-004).
+* Caller-supplied refs/remotes starting with ``-`` are refused (git would
+  parse them as options — argument-injection guard, SEC-004); path
+  arguments are passed after ``--``.
 * Force operations (push --force, reset --hard, clean -f) are CRITICAL and
   blocked unless broker explicitly approves them (fresh approval required
   every time — no scope inheritance for force operations).
@@ -56,6 +62,30 @@ _CRITICAL_GIT_OPS = frozenset({
 })
 
 _GIT_TIMEOUT = 30  # seconds for git subprocess
+
+
+def _validate_git_arg(value: str, *, kind: str = "argument") -> str | None:
+    """
+    Return an error string when ``value`` is unsafe as a git argv element.
+
+    Git parses any ``-``-leading element as an OPTION regardless of
+    position, so a caller-supplied ref/remote starting with ``-`` is
+    argument injection (SEC-004): e.g. ``push(remote="-f")`` would force
+    a push without the CRITICAL force-approval path, or
+    ``rev_parse("--exec-path=...")`` could re-point git's internals.
+    Values are otherwise passed verbatim as single argv elements (no
+    shell), so embedded spaces/quotes are safe.
+    """
+    if not value or not value.strip():
+        return f"Empty git {kind}."
+    if value.startswith("-"):
+        return (
+            f"Git {kind} {value!r} may not start with '-': option-like "
+            "values are refused (argument-injection guard, SEC-004)."
+        )
+    if any(ord(c) < 32 for c in value):
+        return f"Git {kind} contains control characters."
+    return None
 
 
 def _run_git(
@@ -173,6 +203,9 @@ class GitTool(BaseTool):
 
     def show(self, ref: str = "HEAD") -> ToolResult:
         """Show a commit."""
+        err = _validate_git_arg(ref, kind="ref")
+        if err:
+            return self._fail(f"git show: {err}", command="git show")
         ok, stdout, stderr, rc = _run_git(["show", ref, "--stat"], cwd=self.workspace_root)
         self._audit_emit("tool.git.show", {"ref": ref, "returncode": rc})
         return self._git_result(ok, stdout, stderr, rc, f"git show {ref} --stat")
@@ -185,6 +218,9 @@ class GitTool(BaseTool):
 
     def rev_parse(self, ref: str = "HEAD") -> ToolResult:
         """Return the full SHA for a ref."""
+        err = _validate_git_arg(ref, kind="ref")
+        if err:
+            return self._fail(f"git rev-parse: {err}", command="git rev-parse")
         ok, stdout, stderr, rc = _run_git(["rev-parse", ref], cwd=self.workspace_root)
         return self._git_result(ok, stdout.strip(), stderr, rc, f"git rev-parse {ref}")
 
@@ -192,7 +228,7 @@ class GitTool(BaseTool):
         """List tracked files."""
         args = ["ls-files"]
         if path:
-            args.append(path)
+            args.extend(["--", path])
         ok, stdout, stderr, rc = _run_git(args, cwd=self.workspace_root)
         return self._git_result(ok, stdout, stderr, rc, "git ls-files")
 
@@ -212,6 +248,13 @@ class GitTool(BaseTool):
 
         If add_all=True, also runs ``git add -A`` first (also gated).
         """
+        boundary = self._repo_boundary_error("commit")
+        if boundary:
+            self._audit_emit("tool.git.boundary_blocked", {
+                "operation": "commit", "reason": boundary,
+            })
+            return self._fail(boundary, command="git commit")
+
         command = f"git commit -m '{message}'"
         ctx = ActionContext(category="git", command=command)
         approval = self._require_git_mutation_approval(
@@ -252,6 +295,18 @@ class GitTool(BaseTool):
         """
         Push to remote. HIGH risk normally; CRITICAL with force=True.
         """
+        for value, kind in ((remote, "remote"), (branch, "ref")):
+            err = _validate_git_arg(value, kind=kind)
+            if err:
+                return self._fail(f"git push: {err}", command="git push")
+
+        boundary = self._repo_boundary_error("push")
+        if boundary:
+            self._audit_emit("tool.git.boundary_blocked", {
+                "operation": "push", "reason": boundary,
+            })
+            return self._fail(boundary, command="git push")
+
         args = ["push", remote, branch]
         if force:
             args.append("--force")
@@ -285,6 +340,13 @@ class GitTool(BaseTool):
         """
         Stage files for commit. MEDIUM risk — requires approval.
         """
+        boundary = self._repo_boundary_error("add")
+        if boundary:
+            self._audit_emit("tool.git.boundary_blocked", {
+                "operation": "add", "reason": boundary,
+            })
+            return self._fail(boundary, command=f"git add {path}")
+
         command = f"git add {path}"
         ctx = ActionContext(category="git", command=command)
         approval = self._require_git_mutation_approval(
@@ -297,12 +359,45 @@ class GitTool(BaseTool):
         )
         if approval is not None:
             return approval
-        ok, stdout, stderr, rc = _run_git(["add", path], cwd=self.workspace_root)
+        # "--" ends option parsing so a path like "-f" is a pathspec,
+        # never an option (SEC-004).
+        ok, stdout, stderr, rc = _run_git(["add", "--", path], cwd=self.workspace_root)
         return self._git_result(ok, stdout or f"staged: {path}", stderr, rc, command)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _repo_boundary_error(self, operation: str) -> str:
+        """
+        SEC-004: refuse mutations that would cross the repository boundary.
+
+        If ``workspace_root`` is not itself the repository root but a
+        repository exists somewhere above it, running ``git <mutation>``
+        with ``cwd=workspace_root`` would act on the PARENT repository —
+        committing/pushing files beyond the workspace. That is refused
+        explicitly.
+
+        Returns an empty string when it is safe to proceed: either the
+        repository root IS the workspace, or no repository exists at all
+        (git then fails cleanly on its own with "not a git repository").
+        """
+        if not self.workspace_root:
+            return ""
+        ok, stdout, _, _ = _run_git(
+            ["rev-parse", "--show-toplevel"], cwd=self.workspace_root
+        )
+        if not ok or not stdout.strip():
+            return ""  # no repository at all — nothing to cross into
+        top = Path(stdout.strip()).resolve()
+        workspace = self.workspace_root.resolve()
+        if top == workspace:
+            return ""
+        return (
+            f"Refusing git {operation}: workspace {workspace} is not the "
+            f"repository root (repository root is {top}). Mutations are "
+            "confined to the workspace boundary (SEC-004)."
+        )
 
     def _require_git_mutation_approval(
         self,

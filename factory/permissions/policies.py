@@ -32,6 +32,10 @@ NON_NEGOTIABLE: frozenset[str] = frozenset({
     "block_sensitive_to_remote",
     "production_deployment_forbidden",
     "require_approval_tool_install",
+    # Consumed by PermissionBroker._category_requires_approval — a
+    # config-level "false" would silently disable an approval gate,
+    # so it must be non-negotiable like the sibling flags (SEC-007).
+    "require_approval_knowledge_high_impact",
 })
 
 
@@ -74,9 +78,38 @@ class PolicySet:
                 self.extra[key] = value
                 continue
             current = getattr(self, key)
+            # Type guards (SEC-007): a typed policy field only accepts
+            # values of its own type. Non-boolean values in boolean
+            # fields (e.g. the string "false") cannot be interpreted
+            # reliably, and negative/non-int retries make no sense —
+            # both are rejected outright, leaving the current value.
+            if isinstance(current, bool):
+                if not isinstance(value, bool):
+                    warnings.warn(
+                        f"Policy '{key}' expects a bool; rejecting override "
+                        f"{value!r} (SEC-007).",
+                        stacklevel=3,
+                    )
+                    logger.warning(
+                        "Rejected type-confused override for bool policy %s: %r",
+                        key, value,
+                    )
+                    continue
+            elif isinstance(current, int):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    warnings.warn(
+                        f"Policy '{key}' expects a non-negative int; "
+                        f"rejecting override {value!r} (SEC-007).",
+                        stacklevel=3,
+                    )
+                    logger.warning(
+                        "Rejected invalid override for int policy %s: %r",
+                        key, value,
+                    )
+                    continue
             # Prevent weakening non-negotiable boolean policies
             if key in NON_NEGOTIABLE and isinstance(current, bool) and current:
-                if not bool(value):
+                if not value:
                     warnings.warn(
                         f"Policy '{key}' is non-negotiable and cannot be "
                         f"disabled. Ignoring override.",

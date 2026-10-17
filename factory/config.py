@@ -330,15 +330,26 @@ def _apply_policies_yaml(settings: FullSettings, data: dict[str, Any]) -> None:
         "block_sensitive_to_remote",
         "production_deployment_forbidden",
         "require_approval_tool_install",
+        "require_approval_knowledge_high_impact",
     }
     p = data.get("policies", {})
     for key, value in p.items():
         if not hasattr(ps, key):
             continue
         current = getattr(ps, key)
+        # Type guard (SEC-007): typed fields only accept their own type.
+        if isinstance(current, bool):
+            if not isinstance(value, bool):
+                import warnings
+                warnings.warn(
+                    f"Policy '{key}' expects a bool; rejecting override "
+                    f"{value!r} (SEC-007).",
+                    stacklevel=2,
+                )
+                continue
         # Non-negotiable bool policies cannot be set to False
         if key in _NON_NEGOTIABLE and isinstance(current, bool) and current:
-            if not bool(value):
+            if not value:
                 # Silently ignore attempts to weaken — log this
                 import warnings
                 warnings.warn(

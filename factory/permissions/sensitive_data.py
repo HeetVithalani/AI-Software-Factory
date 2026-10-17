@@ -105,6 +105,31 @@ class SensitivityReport:
             self.severity = severity
 
 
+def _normalize_path_text(raw: str) -> str:
+    """
+    Normalise a path string so pattern matching sees the name Win32
+    will actually open (SEC-005).
+
+    * backslashes → forward slashes; duplicate separators collapse;
+    * NTFS alternate-data-stream suffixes stripped (``.env:$DATA`` →
+      ``.env`` — Win32 opens the base stream);
+    * trailing dots and spaces stripped per component (Win32 strips
+      them on open: ``.env.`` → ``.env``).
+    """
+    text = raw.replace("\\", "/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    components: list[str] = []
+    for comp in text.split("/"):
+        if len(comp) == 2 and comp[1] == ":":
+            components.append(comp)          # drive letter, keep as-is
+            continue
+        if ":" in comp:
+            comp = comp.split(":", 1)[0]     # drop ADS/stream suffix
+        components.append(comp.rstrip(" .")) # Win32 strips trailing dots/spaces
+    return "/".join(components)
+
+
 class SensitiveDataDetector:
     """
     Deterministic sensitive data detector.
@@ -121,10 +146,24 @@ class SensitiveDataDetector:
     """
 
     def check_path(self, path: Path) -> SensitivityReport:
-        """Check whether a filesystem path refers to sensitive material."""
+        """
+        Check whether a filesystem path refers to sensitive material.
+
+        The path is normalised before matching (SEC-005):
+
+        * backslashes become forward slashes, duplicate separators
+          collapse;
+        * NTFS alternate-data-stream suffixes (``name:stream``) are
+          stripped from each component — Win32 opens the base file, and
+          an attacker could otherwise hide ``.env`` behind ``.env:$DATA``;
+        * trailing dots and spaces are stripped from each component —
+          Win32 strips them on open (``.env.`` and ``.env   `` resolve to
+          ``.env``), so patterns must see the resolved name.
+        """
         report = SensitivityReport()
-        name = path.name
-        path_str = str(path).replace("\\", "/")
+        path_str = _normalize_path_text(str(path))
+        components = path_str.split("/")
+        name = components[-1] if components else ""
 
         # Check filename patterns
         for pattern in _SENSITIVE_FILENAME_PATTERNS:
@@ -136,7 +175,7 @@ class SensitiveDataDetector:
                 break
 
         # Check path segments
-        parts = set(path_str.lower().split("/"))
+        parts = set(segment for segment in (c.lower() for c in components) if segment)
         for segment in _SENSITIVE_PATH_SEGMENTS:
             if segment.lower() in parts:
                 report.add_reason(

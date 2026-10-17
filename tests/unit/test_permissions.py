@@ -921,3 +921,86 @@ class TestRiskEngineSanity:
             category="file.read", command="cat .env", target_is_sensitive=True
         )
         assert self.engine.classify(ctx) == RiskLevel.CRITICAL
+
+
+# ===========================================================================
+# Policy hardening (SEC-007)
+# ===========================================================================
+
+class TestPolicyHardening:
+    """Non-negotiable policies cannot be weakened — by value or by type."""
+
+    def test_knowledge_approval_weakening_blocked(self):
+        from factory.permissions.policies import PolicySet
+        ps = PolicySet()
+        with pytest.warns(UserWarning, match="non-negotiable"):
+            ps.apply_override({"require_approval_knowledge_high_impact": False})
+        assert ps.require_approval_knowledge_high_impact is True
+
+    def test_non_negotiable_weakening_blocked(self):
+        from factory.permissions.policies import PolicySet
+        ps = PolicySet()
+        with pytest.warns(UserWarning, match="non-negotiable"):
+            ps.apply_override({"production_deployment_forbidden": False})
+        assert ps.production_deployment_forbidden is True
+        with pytest.warns(UserWarning, match="non-negotiable"):
+            ps.apply_override({"require_approval_git_mutations": False})
+        assert ps.require_approval_git_mutations is True
+
+    def test_type_confused_bool_rejected(self):
+        """The string "false" must never replace a boolean gate."""
+        from factory.permissions.policies import PolicySet
+        ps = PolicySet()
+        with pytest.warns(UserWarning, match="expects a bool"):
+            ps.apply_override({"require_approval_git_mutations": "false"})
+        assert ps.require_approval_git_mutations is True
+
+    def test_type_confused_bool_on_relaxable_flag_rejected(self):
+        from factory.permissions.policies import PolicySet
+        ps = PolicySet()
+        with pytest.warns(UserWarning, match="expects a bool"):
+            ps.apply_override({"auto_approve_inherited": "no"})
+        assert ps.auto_approve_inherited is True
+
+    def test_negative_retry_rejected(self):
+        from factory.permissions.policies import PolicySet
+        ps = PolicySet()
+        with pytest.warns(UserWarning, match="non-negative"):
+            ps.apply_override({"max_task_retries": -1})
+        assert ps.max_task_retries == 3
+
+    def test_non_int_retry_rejected(self):
+        from factory.permissions.policies import PolicySet
+        ps = PolicySet()
+        with pytest.warns(UserWarning, match="non-negative"):
+            ps.apply_override({"max_task_retries": "5"})
+        assert ps.max_task_retries == 3
+
+    def test_bool_rejected_for_int_field(self):
+        from factory.permissions.policies import PolicySet
+        ps = PolicySet()
+        with pytest.warns(UserWarning, match="non-negative"):
+            ps.apply_override({"max_task_retries": True})
+        assert ps.max_task_retries == 3
+
+    def test_legitimate_relaxation_still_allowed(self):
+        from factory.permissions.policies import PolicySet
+        ps = PolicySet()
+        ps.apply_override({"auto_approve_inherited": False, "max_task_retries": 5})
+        assert ps.auto_approve_inherited is False
+        assert ps.max_task_retries == 5
+
+    def test_config_path_non_negotiable_parity(self):
+        """config.py mirrors the same non-negotiable set (SEC-007)."""
+        from factory.config import _apply_policies_yaml
+        from factory.config import FullSettings
+        settings = FullSettings()
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            _apply_policies_yaml(settings, {"policies": {
+                "require_approval_knowledge_high_impact": False,
+                "production_deployment_forbidden": False,
+            }})
+        assert settings.policies.require_approval_knowledge_high_impact is True
+        assert settings.policies.production_deployment_forbidden is True

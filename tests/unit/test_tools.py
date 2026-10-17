@@ -681,6 +681,104 @@ class TestGitToolMutations:
 
 
 # ---------------------------------------------------------------------------
+# GitTool — repository boundary + argument-injection guards (SEC-004)
+# ---------------------------------------------------------------------------
+
+class TestGitToolBoundaryAndArgs:
+    def _subdir_workspace(self, tmp_path):
+        """A workspace that is a SUBDIRECTORY of a parent git repo."""
+        import subprocess
+        parent = tmp_path / "parent"
+        parent.mkdir()
+        subprocess.run(["git", "init"], cwd=parent, capture_output=True)
+        sub = parent / "sub"
+        sub.mkdir()
+        return sub
+
+    def test_commit_refused_in_subdir_of_parent_repo(self, tmp_path):
+        from factory.tools.git import GitTool
+        sub = self._subdir_workspace(tmp_path)
+        tool = GitTool(workspace_root=sub, broker=_broker_always_approve())
+        result = tool.commit("cross-boundary commit")
+        assert not result.success
+        assert "boundary" in result.error.lower()
+        assert "repository root" in result.error.lower()
+
+    def test_push_refused_in_subdir_of_parent_repo(self, tmp_path):
+        from factory.tools.git import GitTool
+        sub = self._subdir_workspace(tmp_path)
+        tool = GitTool(workspace_root=sub, broker=_broker_always_approve())
+        result = tool.push("origin", "main")
+        assert not result.success
+        assert "boundary" in result.error.lower()
+
+    def test_add_refused_in_subdir_of_parent_repo(self, tmp_path):
+        from factory.tools.git import GitTool
+        sub = self._subdir_workspace(tmp_path)
+        (sub / "file.txt").write_text("x")
+        tool = GitTool(workspace_root=sub, broker=_broker_always_approve())
+        result = tool.add("file.txt")
+        assert not result.success
+        assert "boundary" in result.error.lower()
+
+    def test_mutation_allowed_at_repo_root(self, tmp_path):
+        """Positive control: repo root == workspace → mutations proceed."""
+        import subprocess
+        from factory.tools.git import GitTool
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@t.com"], cwd=tmp_path, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "T"], cwd=tmp_path, capture_output=True
+        )
+        (tmp_path / "file.txt").write_text("content")
+        tool = GitTool(workspace_root=tmp_path, broker=_broker_always_approve())
+        add_result = tool.add("file.txt")
+        assert add_result.success, add_result.error
+        commit_result = tool.commit("boundary ok")
+        assert commit_result.success, commit_result.error
+
+    @pytest.mark.parametrize("ref", ["-output=evil", "--git-dir=/tmp/x", "-"])
+    def test_show_ref_leading_dash_refused(self, tmp_path, ref):
+        from factory.tools.git import GitTool
+        tool = GitTool(workspace_root=tmp_path)
+        result = tool.show(ref)
+        assert not result.success
+        assert "may not start with '-'" in result.error
+
+    def test_rev_parse_leading_dash_refused(self, tmp_path):
+        from factory.tools.git import GitTool
+        tool = GitTool(workspace_root=tmp_path)
+        result = tool.rev_parse("--exec-path=/tmp/x")
+        assert not result.success
+        assert "may not start with '-'" in result.error
+
+    def test_push_remote_leading_dash_cannot_bypass_force_gate(self, tmp_path):
+        """remote='-f' would turn a normal push into a force push (SEC-004)."""
+        from factory.tools.git import GitTool
+        tool = GitTool(workspace_root=tmp_path, broker=_broker_always_deny())
+        result = tool.push("-f", "main")
+        assert not result.success
+        # The argument guard fires — not merely the broker denial.
+        assert "may not start with '-'" in result.error
+
+    def test_push_branch_leading_dash_refused(self, tmp_path):
+        from factory.tools.git import GitTool
+        tool = GitTool(workspace_root=tmp_path, broker=_broker_always_deny())
+        result = tool.push("origin", "--force")
+        assert not result.success
+        assert "may not start with '-'" in result.error
+
+    def test_ref_with_control_characters_refused(self, tmp_path):
+        from factory.tools.git import GitTool
+        tool = GitTool(workspace_root=tmp_path)
+        result = tool.show("HEAD\n--upload-pack=evil")
+        assert not result.success
+        assert "control characters" in result.error
+
+
+# ---------------------------------------------------------------------------
 # TestingTool — pytest parser
 # ---------------------------------------------------------------------------
 
@@ -960,3 +1058,118 @@ class TestBrowserToolValidation:
         result = tool.fetch("https://docs.python.org/3/")
         assert not result.success
         assert "denied" in result.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# BrowserTool — redirect re-validation (SEC-003, no real network)
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code: int = 200, headers: dict | None = None,
+                 content: bytes = b"body"):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.content = content
+
+
+class _FakeClient:
+    """Duck-typed httpx.Client replacement: scripted responses, URL log."""
+
+    def __init__(self, responses: list[_FakeResponse]):
+        self._responses = list(responses)
+        self.requested: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url: str, headers: dict | None = None):
+        self.requested.append(url)
+        if not self._responses:
+            return _FakeResponse()
+        return self._responses.pop(0)
+
+
+class TestBrowserRedirects:
+    """Every redirect hop is validated before it is followed (SEC-003)."""
+
+    @staticmethod
+    def _tool():
+        from factory.tools.browser import BrowserTool
+        return BrowserTool(broker=_broker_always_approve())
+
+    def test_redirect_to_metadata_host_blocked(self):
+        fake = _FakeClient([
+            _FakeResponse(302, {"location": "http://169.254.169.254/latest/meta-data/"}),
+        ])
+        tool = self._tool()
+        with patch("httpx.Client", return_value=fake):
+            result = tool.fetch("https://docs.python.org/3/")
+        assert not result.success
+        assert "Redirect target blocked" in result.error
+        assert "169.254.169.254" in result.error
+        # The blocked target was never requested.
+        assert fake.requested == ["https://docs.python.org/3/"]
+
+    def test_redirect_to_loopback_blocked(self):
+        fake = _FakeClient([
+            _FakeResponse(302, {"location": "http://127.0.0.1:8500/v1/secret"}),
+        ])
+        tool = self._tool()
+        with patch("httpx.Client", return_value=fake):
+            result = tool.fetch("https://docs.python.org/3/")
+        assert not result.success
+        assert "Redirect target blocked" in result.error
+
+    def test_redirect_to_non_http_scheme_blocked(self):
+        fake = _FakeClient([
+            _FakeResponse(301, {"location": "file:///C:/Windows/win.ini"}),
+        ])
+        tool = self._tool()
+        with patch("httpx.Client", return_value=fake):
+            result = tool.fetch("https://docs.python.org/3/")
+        assert not result.success
+        assert "Redirect target blocked" in result.error
+        assert "scheme" in result.error.lower()
+
+    def test_relative_redirect_resolved_and_followed(self, monkeypatch):
+        monkeypatch.setattr(
+            "factory.tools.browser._validate_url", lambda u: None
+        )
+        fake = _FakeClient([
+            _FakeResponse(302, {"location": "/en/library/index.html"}),
+            _FakeResponse(200, {}, b"final page"),
+        ])
+        tool = self._tool()
+        with patch("httpx.Client", return_value=fake):
+            result = tool.fetch("https://docs.python.org/3/")
+        assert result.success
+        assert result.output == "final page"
+        assert fake.requested == [
+            "https://docs.python.org/3/",
+            "https://docs.python.org/en/library/index.html",
+        ]
+
+    def test_redirect_budget_exhausted_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(
+            "factory.tools.browser._validate_url", lambda u: None
+        )
+        hop = _FakeResponse(302, {"location": "/next"})
+        fake = _FakeClient([hop, hop, hop, hop, hop])
+        tool = self._tool()
+        with patch("httpx.Client", return_value=fake):
+            result = tool.fetch("https://docs.python.org/3/")
+        assert not result.success
+        assert "Too many redirects" in result.error
+        assert len(fake.requested) == 4  # 3 followed hops + one final attempt
+
+    def test_redirect_without_location_treated_as_final(self):
+        fake = _FakeClient([_FakeResponse(302, {})])
+        tool = self._tool()
+        with patch("httpx.Client", return_value=fake):
+            result = tool.fetch("https://docs.python.org/3/")
+        # Malformed redirect is not followed — the response stands as-is.
+        assert len(fake.requested) == 1
+        assert result.returncode == 302

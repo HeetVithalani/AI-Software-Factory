@@ -10,6 +10,10 @@ Security model
   172.16.0.0/12, 192.168.0.0/16, ::1).
 * Metadata endpoints (169.254.0.0/16) are blocked.
 * The URL must use http:// or https:// schemes only.
+* Redirects: automatic following is OFF. At most 3 hops are followed,
+  and EVERY redirect target (resolved against the current URL) is
+  re-validated — scheme, host, private-IP — before it is requested
+  (SEC-003). Blocked hops fail the fetch instead of being followed.
 * All fetches require broker approval (HIGH risk).
 * Response size is capped at 1 MB.
 * Cookies and redirects to blocked hosts are rejected.
@@ -31,7 +35,7 @@ import socket
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from factory.permissions.risk import ActionContext
 from factory.tools.base import BaseTool, ToolResult
@@ -41,6 +45,8 @@ logger = logging.getLogger(__name__)
 _MAX_RESPONSE_BYTES = 1 * 1024 * 1024  # 1 MB
 _DEFAULT_TIMEOUT = 15  # seconds
 _BROWSER_TOOL_UA = "AI-Software-Factory/0.1 (read-only research)"
+_MAX_REDIRECTS = 3
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 # Private / reserved IP ranges to block
 _BLOCKED_RANGES = [
@@ -209,11 +215,19 @@ class BrowserTool(BaseTool):
         try:
             with httpx.Client(
                 timeout=self.timeout,
-                follow_redirects=True,
-                max_redirects=3,
+                follow_redirects=False,
             ) as client:
-                response = client.get(url, headers=req_headers)
+                response, redirect_error = self._follow_redirects(
+                    client, url, req_headers
+                )
             duration_ms = (time.monotonic() - start) * 1000
+
+            if response is None:
+                # Blocked or excessive redirect — never silently followed.
+                self._audit_emit("tool.browser.blocked", {
+                    "url": url, "reason": redirect_error,
+                })
+                return self._fail(redirect_error, command=f"fetch:{url}")
 
             # Cap response size
             raw = response.content[:_MAX_RESPONSE_BYTES]
@@ -260,3 +274,57 @@ class BrowserTool(BaseTool):
                 f"Request error: {exc}",
                 command=f"fetch:{url}",
             )
+
+    # ------------------------------------------------------------------
+    # Redirect handling (SEC-003)
+    # ------------------------------------------------------------------
+
+    def _follow_redirects(
+        self, client: Any, url: str, headers: dict[str, str]
+    ) -> tuple[Any, str]:
+        """
+        GET ``url``, re-validating EVERY redirect hop (SEC-003).
+
+        Redirect targets are attacker-controllable: the initial URL
+        validation is meaningless if a public URL can bounce the client
+        to a private/metadata host. Each ``Location`` is therefore
+        resolved (relative → absolute) and run through the same
+        :func:`_validate_url` gate — scheme, host, and private-IP
+        checks — before it is followed.
+
+        Returns ``(response, "")`` on a normal (non-redirect) response,
+        or ``(None, reason)`` when a hop was blocked or the redirect
+        budget was exhausted. At most ``_MAX_REDIRECTS`` hops are
+        followed.
+
+        Known limitation (documented, not defended here): DNS
+        rebinding TOCTOU — validation resolves the hostname once, then
+        httpx resolves again at connect time. Closing that gap requires
+        pinning the validated IP into the transport; deferred with this
+        note rather than papered over.
+        """
+        current = url
+        for _hop in range(_MAX_REDIRECTS + 1):
+            response = client.get(current, headers=headers)
+            if response.status_code not in _REDIRECT_STATUSES:
+                return response, ""
+
+            location = response.headers.get("location")
+            if not location:
+                return response, ""  # malformed redirect → treat as final
+
+            next_url = urljoin(current, location)
+            self._audit_emit("tool.browser.redirect", {
+                "from": current,
+                "to": next_url,
+                "hop": _hop + 1,
+                "status_code": response.status_code,
+            })
+            err = _validate_url(next_url)
+            if err:
+                return None, f"Redirect target blocked: {err}"
+            current = next_url
+
+        return None, (
+            f"Too many redirects (max {_MAX_REDIRECTS}): {url}"
+        )
