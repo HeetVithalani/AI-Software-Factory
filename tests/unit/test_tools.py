@@ -14,6 +14,8 @@ Strategy:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -145,6 +147,141 @@ class TestBaseSandbox:
         t = T(workspace_root=None)
         result = t._sandbox_path(tmp_path / "anything.txt")
         assert result is not None
+
+    # -- SEC-001 regression suite ------------------------------------------
+
+    @staticmethod
+    def _tool(tmp_path):
+        from factory.tools.base import BaseTool
+        class T(BaseTool):
+            tool_name = "test"
+            def run(self, task): ...
+        return T(workspace_root=tmp_path)
+
+    def test_traversal_dotdot_blocked(self, tmp_path):
+        from factory.errors import ToolError
+        t = self._tool(tmp_path)
+        (tmp_path.parent / "outside_trav.txt").write_text("x")
+        with pytest.raises(ToolError):
+            t._sandbox_path(Path("..") / "outside_trav.txt")
+
+    def test_prefix_sibling_directory_blocked(self, tmp_path):
+        """'proj_evil' must not count as inside 'proj' (prefix boundary)."""
+        from factory.errors import ToolError
+        root = tmp_path / "proj"
+        root.mkdir()
+        sibling = tmp_path / "proj_evil"
+        sibling.mkdir()
+        tool = self._tool(root)
+        with pytest.raises(ToolError):
+            tool._sandbox_path(sibling / "secrets.txt")
+
+    def test_case_variation_inside_allowed(self, tmp_path):
+        """Case-different spelling of an inside path is allowed (win32)."""
+        if os.name != "nt":
+            pytest.skip("case-insensitive comparison is a Windows concern")
+        root = tmp_path / "Proj"
+        root.mkdir()
+        (root / "file.txt").write_text("x")
+        tool = self._tool(root)
+        # Same path with different casing
+        variant = tmp_path / "PROJ" / "FILE.TXT"
+        result = tool._sandbox_path(variant)
+        assert os.path.normcase(str(result)) == os.path.normcase(
+            str((root / "file.txt").resolve())
+        )
+
+    def test_nul_byte_blocked(self, tmp_path):
+        from factory.errors import ToolError
+        tool = self._tool(tmp_path)
+        with pytest.raises(ToolError):
+            tool._sandbox_path(Path("with\x00nul.txt"))
+
+    def _make_dir_symlink(self, link: Path, target: Path) -> None:
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(
+                "SEC-001 reported limitation: symlink creation not "
+                f"permitted on this host ({exc})."
+            )
+
+    def test_symlink_inside_workspace_rejected(self, tmp_path):
+        """A link INSIDE the root is rejected (no check-then-use indirection)."""
+        from factory.errors import ToolError
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "file.txt").write_text("x")
+        link = tmp_path / "link"
+        self._make_dir_symlink(link, real)
+
+        tool = self._tool(tmp_path)
+        with pytest.raises(ToolError) as exc_info:
+            tool._sandbox_path(link / "file.txt")
+        assert "symbolic link" in str(exc_info.value)
+
+    def test_symlink_escaping_workspace_rejected(self, tmp_path):
+        """A link pointing outside the root is rejected."""
+        from factory.errors import ToolError
+        outside = tmp_path.parent / "sec001_outside"
+        outside.mkdir(exist_ok=True)
+        (outside / "secret.txt").write_text("secret")
+        link = tmp_path / "escape"
+        self._make_dir_symlink(link, outside)
+
+        tool = self._tool(tmp_path)
+        with pytest.raises(ToolError):
+            tool._sandbox_path(link / "secret.txt")
+
+    def test_junction_inside_workspace_rejected(self, tmp_path):
+        """NTFS junctions are rejected like symlinks (SEC-001)."""
+        from factory.errors import ToolError
+        if os.name != "nt":
+            pytest.skip("junctions are a Windows-only concept")
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "file.txt").write_text("x")
+        junction = tmp_path / "junction"
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(real)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            pytest.skip(
+                "SEC-001 reported limitation: junction creation failed "
+                f"on this host ({proc.stderr.strip()})."
+            )
+        try:
+            tool = self._tool(tmp_path)
+            with pytest.raises(ToolError) as exc_info:
+                tool._sandbox_path(junction / "file.txt")
+            assert "junction" in str(exc_info.value).lower()
+        finally:
+            os.rmdir(junction)  # removing a junction does not touch target
+
+    def test_junction_escaping_workspace_rejected(self, tmp_path):
+        from factory.errors import ToolError
+        if os.name != "nt":
+            pytest.skip("junctions are a Windows-only concept")
+        outside = tmp_path.parent / "sec001_junc_outside"
+        outside.mkdir(exist_ok=True)
+        (outside / "secret.txt").write_text("secret")
+        junction = tmp_path / "escape_junction"
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            pytest.skip(
+                "SEC-001 reported limitation: junction creation failed "
+                f"on this host ({proc.stderr.strip()})."
+            )
+        try:
+            tool = self._tool(tmp_path)
+            with pytest.raises(ToolError):
+                tool._sandbox_path(junction / "secret.txt")
+        finally:
+            os.rmdir(junction)
 
 
 # ---------------------------------------------------------------------------

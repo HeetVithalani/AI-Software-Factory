@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import stat
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,19 +128,50 @@ class BaseTool:
 
     def _sandbox_path(self, path: Path) -> Path:
         """
-        Resolve path and verify it is within the workspace sandbox.
+        Resolve path and verify it is within the workspace sandbox (SEC-001).
+
+        Fail-closed checks, in order:
+
+        1. **NUL byte** — never a valid path component.
+        2. **Resolved containment** — the ``resolve()``'d path (which
+           collapses ``..`` traversal and follows links to their final
+           target) must sit inside ``workspace_root``.
+        3. **Explicit case-normalised containment** — belt and braces on
+           top of ``relative_to``: normcase prefix equality with a
+           separator boundary, so ``/proj_evil`` can never count as
+           inside ``/proj`` on a case-insensitive filesystem.
+        4. **No link components below the root** — every component of the
+           *original* (unresolved) requested path that lies strictly
+           below the workspace root is ``lstat``'d; symbolic links and
+           NTFS junctions (reparse indirections) are rejected outright,
+           even when they currently point INSIDE the workspace. This
+           removes the check-then-use indirection that could be
+           retargeted between validation and use. Cloud-placeholder
+           reparse points (e.g. Files On-Demand) are not links and are
+           not rejected.
 
         Relative paths are resolved relative to workspace_root.
-        Raises ToolError if the resolved path escapes the workspace.
+        Raises ToolError if any check fails.
         """
         if self.workspace_root is None:
             return path.resolve()
+
+        if "\x00" in str(path):
+            raise ToolError(
+                f"Path {str(path)!r} contains a NUL byte.",
+                tool=self.tool_name,  # type: ignore[call-arg]
+            )
+
         root = self.workspace_root.resolve()
         # Resolve relative paths against workspace_root, not cwd
         if not path.is_absolute():
             resolved = (root / path).resolve()
+            original = self.workspace_root / path
         else:
             resolved = path.resolve()
+            original = path
+
+        # -- 2. resolved containment --
         try:
             resolved.relative_to(root)
         except ValueError:
@@ -146,7 +179,61 @@ class BaseTool:
                 f"Path {path!r} is outside the workspace sandbox {root!r}.",
                 tool=self.tool_name,  # type: ignore[call-arg]
             )
+
+        # -- 3. explicit case-normalised containment --
+        root_key = os.path.normcase(str(root))
+        resolved_key = os.path.normcase(str(resolved))
+        if resolved_key != root_key and not resolved_key.startswith(root_key + os.sep):
+            raise ToolError(
+                f"Path {path!r} is outside the workspace sandbox {root!r}.",
+                tool=self.tool_name,  # type: ignore[call-arg]
+            )
+
+        # -- 4. no symlink/junction components below the root --
+        self._reject_link_components(path, original)
+
         return resolved
+
+    def _reject_link_components(self, display: Path, original: Path) -> None:
+        """
+        Raise ToolError if ``original`` traverses a symlink or junction
+        below the workspace root (SEC-001 component check).
+        """
+        root_keys = {
+            os.path.normcase(os.path.abspath(str(self.workspace_root))),
+            os.path.normcase(str(self.workspace_root.resolve())),
+        }
+        is_junction = getattr(os.path, "isjunction", None)
+
+        current: Path | None = None
+        for part in original.parts:
+            current = Path(part) if current is None else current / part
+            key = os.path.normcase(os.path.abspath(str(current)))
+            if not any(key.startswith(rk + os.sep) for rk in root_keys):
+                # At or above the workspace root — the root's own
+                # placement is deliberate and not this check's concern.
+                continue
+            try:
+                st = os.lstat(current)
+            except (OSError, ValueError):
+                # Component does not exist (yet) — nothing to reject;
+                # anything created later is created by us, not linked.
+                continue
+
+            if stat.S_ISLNK(st.st_mode):
+                raise ToolError(
+                    f"Path {display!r} traverses symbolic link {current!r}: "
+                    "links inside the workspace are not permitted "
+                    "(SEC-001).",
+                    tool=self.tool_name,  # type: ignore[call-arg]
+                )
+            if is_junction is not None and is_junction(current):
+                raise ToolError(
+                    f"Path {display!r} traverses directory junction "
+                    f"{current!r}: links inside the workspace are not "
+                    "permitted (SEC-001).",
+                    tool=self.tool_name,  # type: ignore[call-arg]
+                )
 
     def _check_permission(
         self,
